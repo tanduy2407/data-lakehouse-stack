@@ -1,0 +1,78 @@
+version: '3.8'
+
+# Metadata layer: Hive Metastore for table catalog
+# Depends on: core (minio + postgres)
+
+services:
+  minio-bucket-init:
+    image: quay.io/minio/mc:latest
+    container_name: setup-minio
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: "/bin/sh"
+    command:
+      - "-c"
+      - >-
+        echo Creating MinIO warehouse layout...;
+        mc alias set pol http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+        mc mb --ignore-existing pol/${MINIO_WAREHOUSE_BUCKET};
+        mc ls pol;
+        mc ls pol/${MINIO_WAREHOUSE_BUCKET};
+        echo Bucket setup complete.
+    networks:
+      - data-lakehouse-stack_network
+
+  hive-metastore:
+    image: apache/hive:4.0.0
+    container_name: hive-metastore
+    ports:
+      - "9083:9083"
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      DB_TYPE: postgres
+      CONN_DRIVER_NAME: org.postgresql.Driver
+      CONNECTION_URL: jdbc:postgresql://postgres:5432/hive_metastore
+      CONNECTION_USER: ${POSTGRES_USER}
+      CONNECTION_PASSWORD: ${POSTGRES_PASSWORD}
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/hive_metastore
+        -Djavax.jdo.option.ConnectionUserName=${POSTGRES_USER}
+        -Djavax.jdo.option.ConnectionPassword=${POSTGRES_PASSWORD}
+        -Dfs.s3a.endpoint=${MINIO_ENDPOINT}
+        -Dfs.s3a.path.style.access=${S3_PATH_STYLE_ACCESS}
+        -Dfs.s3a.access.key=${MINIO_ROOT_USER}
+        -Dfs.s3a.secret.key=${MINIO_ROOT_PASSWORD}
+        -Dfs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+        -Dfs.s3a.connection.ssl.enabled=false
+      WAREHOUSE_DIR: s3a://${MINIO_WAREHOUSE_BUCKET}/
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_ENDPOINT: ${MINIO_ENDPOINT}
+      S3_USE_PATH_STYLE_ACCESS: ${S3_PATH_STYLE_ACCESS}
+    volumes:
+      - ./hive/conf/core-site.xml:/opt/hive/conf/core-site.xml:ro
+      - ./hive/scripts:/workspace/hive/scripts
+      - ./hive/jars/postgresql-42.7.4.jar:/opt/hive/lib/postgresql-42.7.4.jar:ro
+      - ./hive/jars/hadoop-aws-3.3.6.jar:/opt/hive/lib/hadoop-aws-3.3.6.jar:ro
+      - ./hive/jars/aws-java-sdk-bundle-1.12.367.jar:/opt/hive/lib/aws-java-sdk-bundle-1.12.367.jar:ro
+    networks:
+      - data-lakehouse-stack_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-bucket-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/9083'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  data-lakehouse-stack_network:
+    driver: bridge

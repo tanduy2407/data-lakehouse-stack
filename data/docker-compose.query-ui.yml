@@ -1,0 +1,80 @@
+version: '3.8'
+
+# Query engines & UI layer: Trino + Superset
+# Depends on: metadata (hive-metastore)
+
+services:
+  trino:
+    image: trinodb/trino:465
+    container_name: trino
+    ports:
+      - "8080:8080"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+    networks:
+      - data-lakehouse-stack_network
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-bucket-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+
+  superset:
+    image: apache/superset:latest
+    container_name: superset
+    user: root
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SUPERSET_ADMIN_USERNAME: ${SUPERSET_ADMIN_USERNAME}
+      SUPERSET_ADMIN_FIRSTNAME: ${SUPERSET_ADMIN_FIRSTNAME}
+      SUPERSET_ADMIN_LASTNAME: ${SUPERSET_ADMIN_LASTNAME}
+      SUPERSET_ADMIN_EMAIL: ${SUPERSET_ADMIN_EMAIL}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+    volumes:
+      - superset_home_data:/app/superset_home
+    networks:
+      - data-lakehouse-stack_network
+    depends_on:
+      trino:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        uv pip install --python /app/.venv/bin/python trino sqlalchemy-trino psycopg2-binary &&
+        superset db upgrade &&
+        (superset fab create-admin
+        --username "$${SUPERSET_ADMIN_USERNAME}"
+        --firstname "$${SUPERSET_ADMIN_FIRSTNAME}"
+        --lastname "$${SUPERSET_ADMIN_LASTNAME}"
+        --email "$${SUPERSET_ADMIN_EMAIL}"
+        --password "$${SUPERSET_ADMIN_PASSWORD}" || true) &&
+        superset init &&
+        superset set-database-uri -d PostgreSQL -u postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB} &&
+        superset set-database-uri -d Hive_Metastore_PostgreSQL -u postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/hive_metastore &&
+        superset set-database-uri -d Trino -u trino://trino@trino:8080/iceberg/gold &&
+        superset run -h 0.0.0.0 -p 8088
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 20s
+      timeout: 8s
+      retries: 12
+
+networks:
+  data-lakehouse-stack_network:
+    driver: bridge
+
+volumes:
+  superset_home_data:

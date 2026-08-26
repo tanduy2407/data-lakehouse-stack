@@ -1,0 +1,33 @@
+version: '3.8'
+
+# Monitoring layer: Data quality monitor
+# Depends on: core (postgres)
+
+services:
+  dq-monitor:
+    image: python:3.12-alpine
+    container_name: dq-monitor
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      MONITOR_POLL_INTERVAL: ${MONITOR_POLL_INTERVAL}
+      MONITOR_ALERT_WINDOW_MINUTES: ${MONITOR_ALERT_WINDOW_MINUTES}
+      MONITOR_JOB_FRESHNESS_HOURS: ${MONITOR_JOB_FRESHNESS_HOURS}
+    volumes:
+      - ./monitor:/app:ro
+    networks:
+      - data-lakehouse-stack_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - "pip install --quiet psycopg2-binary requests && python /app/monitor.py"
+    restart: unless-stopped
+
+networks:
+  data-lakehouse-stack_network:
+    driver: bridge

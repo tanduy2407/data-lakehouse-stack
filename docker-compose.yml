@@ -1,0 +1,34 @@
+version: '3.8'
+
+# DEPRECATED: This file uses "include:" which requires Docker Compose v2.1+
+# and is not supported by podman-compose 1.6.0
+#
+# Instead, use the Makefile targets for modular composition:
+#
+#   make up-core          - PostgreSQL + MinIO only
+#   make up-meta          - Core + Hive Metastore
+#   make up-query         - Core + Metadata + Trino/Superset
+#   make up-processing    - Core + Metadata + Glue jobs
+#   make up-full          - All services (default)
+#
+# For manual composition without Makefile:
+#   podman compose -f data/docker-compose.core.yml \
+#                  -f data/docker-compose.metadata.yml \
+#                  -f data/docker-compose.processing.yml \
+#                  -f data/docker-compose.query-ui.yml \
+#                  -f data/docker-compose.monitoring.yml up -d
+#
+# See COMPOSE_STRUCTURE.md for complete documentation
+
+# This file is kept for backwards compatibility with Docker Compose v2.1+
+# If you're using Docker Compose v2.1+ (instead of podman-compose),
+# uncomment the lines below to enable the include: feature
+#
+# include:
+#   - path: ./data/docker-compose.core.yml
+#   - path: ./data/docker-compose.metadata.yml
+#   - path: ./data/docker-compose.processing.yml
+#   - path: ./data/docker-compose.query-ui.yml
+#   - path: ./data/docker-compose.monitoring.yml
+
+# For podman-compose users: use 'make' targets instead

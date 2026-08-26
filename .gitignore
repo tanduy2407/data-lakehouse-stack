@@ -1,0 +1,38 @@
+# Runtime volume data — never commit persisted storage
+data/minio/
+data/postgres/db/
+data/superset/home/
+data/glue/data/
+data/hive/jars/
+
+# Generated archives
+*.zip
+
+# Secrets
+.env
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Spark / Hadoop temp
+derby.log
+metastore_db/
+spark-warehouse/
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
