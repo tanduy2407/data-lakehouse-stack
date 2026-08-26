@@ -4,6 +4,7 @@ data/postgres/db/
 data/superset/home/
 data/glue/data/
 data/hive/jars/
+data/fake/
 
 # Generated archives
 *.zip

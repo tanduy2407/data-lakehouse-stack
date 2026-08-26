@@ -56,7 +56,7 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     df = build_fake_events(rows=args.rows, seed=args.seed)
-    df.to_parquet(output_path, index=False)
+    df.to_parquet(output_path, index=False, coerce_timestamps="us")
 
     print(f"Wrote {len(df)} rows to {output_path}")
 
