@@ -27,48 +27,38 @@ aws_secret_access_key = os.environ["AWS_SECRET_ACCESS_KEY"]
 aws_region = os.environ["AWS_REGION"]
 
 
-def create_spark_session(app_name="StoreParquetToS3"):
-    return (
+def create_spark_session(
+    access_key_id,
+    secret_access_key,
+    region,
+    app_name="StoreParquetToS3",
+):
+    builder = (
         SparkSession.builder
         .appName(app_name)
         .config(
             "spark.jars",
             "/Users/duy.pham@optum.com/Documents/DataEngineer/"
-            "data-lakehouse-stack/data/hive/jars/hadoop-aws-3.3.6.jar,"
+            "data-lakehouse-stack/data/hive/jars/hadoop-aws-3.4.1.jar,"
             "/Users/duy.pham@optum.com/Documents/DataEngineer/"
-            "data-lakehouse-stack/data/hive/jars/aws-java-sdk-bundle-1.12.367.jar",
+            "data-lakehouse-stack/data/hive/jars/bundle-2.24.6.jar",
         )
-        .getOrCreate()
+        .config("spark.hadoop.fs.s3a.connection.timeout", "60000")
+        .config("spark.hadoop.fs.s3a.connection.establish.timeout", "60000")
+        .config("spark.hadoop.fs.s3a.connection.request.timeout", "60000")
+        .config("spark.hadoop.fs.s3a.connection.ttl", "60000")
+        .config("spark.hadoop.fs.s3a.connection.idle.time", "60000")
+        .config("spark.hadoop.fs.s3a.connection.acquisition.timeout", "60000")
+        .config("spark.hadoop.fs.s3a.access.key", access_key_id)
+        .config("spark.hadoop.fs.s3a.secret.key", secret_access_key)
+        .config(
+            "spark.hadoop.fs.s3a.aws.credentials.provider",
+            "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
+        )
+        .config("spark.hadoop.fs.s3a.endpoint.region", region)
     )
 
-
-def configure_spark_for_s3(
-    spark: SparkSession,
-    access_key_id=None,
-    secret_access_key=None,
-    region=None,
-    endpoint_url=None,
-) -> None:
-    if bool(access_key_id) != bool(secret_access_key):
-        raise ValueError(
-            "Both access_key_id and secret_access_key must be provided together")
-
-    hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
-
-    if access_key_id and secret_access_key:
-        hadoop_conf.set("fs.s3a.access.key", access_key_id)
-        hadoop_conf.set("fs.s3a.secret.key", secret_access_key)
-        hadoop_conf.set("fs.s3a.aws.credentials.provider",
-                        "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
-        hadoop_conf.set("fs.s3a.endpoint.region", region)
-        hadoop_conf.set("fs.s3a.connection.timeout", "60000")
-        hadoop_conf.set("fs.s3a.connection.establish.timeout", "60000")
-        hadoop_conf.set("fs.s3a.connection.request.timeout", "60000")
-        hadoop_conf.set("fs.s3a.connection.ttl", "60000")
-        hadoop_conf.set("fs.s3a.connection.idle.time", "60000")
-    if endpoint_url:
-        hadoop_conf.set("fs.s3a.endpoint", endpoint_url)
-        hadoop_conf.set("fs.s3a.path.style.access", "true")
+    return builder.getOrCreate()
 
 
 def normalize_s3a_uri(s3_uri: str) -> str:
@@ -87,16 +77,16 @@ def write_parquet_to_s3(
         access_key_id: str,
         secret_access_key: str,
         region: str):
-    active_spark = create_spark_session()
-    configure_spark_for_s3(
-        spark=active_spark,
+    active_spark = create_spark_session(
         access_key_id=access_key_id,
         secret_access_key=secret_access_key,
-        region=region
+        region=region,
     )
 
     target_uri = normalize_s3a_uri(s3_uri)
+    print(target_uri)
     df = active_spark.read.parquet(str(source_file))
+    df.show()
     df.write.mode(mode).parquet(target_uri)
     print(f"Wrote Parquet data from {source_file} to {target_uri}")
 

@@ -1,0 +1,1 @@
+config_s3_uri: s3://duncan-bucket-20250407/test_write_parquet/config_test/store_to_s3_glue.yaml
