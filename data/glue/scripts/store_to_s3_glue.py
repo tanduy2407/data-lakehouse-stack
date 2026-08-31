@@ -9,6 +9,17 @@ from pyspark.context import SparkContext
 import yaml
 
 
+def parse_s3_uri(s3_uri: str) -> tuple:
+    if not isinstance(s3_uri, str) or not s3_uri.startswith("s3://"):
+        raise ValueError("S3 URI must start with s3://")
+
+    bucket, separator, key = s3_uri.removeprefix("s3://").partition("/")
+    if not bucket or not separator or not key:
+        raise ValueError("S3 URI must include both a bucket and object key")
+
+    return bucket, key
+
+
 def validate_config(config: dict) -> dict:
     if not isinstance(config, dict):
         raise ValueError("Configuration must be a YAML mapping")
@@ -24,8 +35,10 @@ def validate_config(config: dict) -> dict:
         layer_config = config[layer]
         if not isinstance(layer_config, dict):
             raise ValueError(f"{layer} must be a mapping")
-        if not layer_config.get("s3_uri", "").startswith("s3://"):
-            raise ValueError(f"{layer}.s3_uri must start with s3://")
+        try:
+            parse_s3_uri(layer_config.get("s3_uri"))
+        except ValueError as error:
+            raise ValueError(f"Invalid {layer}.s3_uri: {error}") from error
         if layer_config.get("write_mode") not in {"append", "overwrite", "error", "ignore"}:
             raise ValueError(
                 f"{layer}.write_mode must be append, overwrite, error, or ignore"
@@ -34,7 +47,7 @@ def validate_config(config: dict) -> dict:
 
 
 def load_s3_config(config_uri: str) -> dict:
-    bucket, key = config_uri.removeprefix("s3://").split("/", 1)
+    bucket, key = parse_s3_uri(config_uri)
     response = boto3.client("s3").get_object(Bucket=bucket, Key=key)
     yaml_contents = response["Body"].read().decode("utf-8")
     return validate_config(yaml.safe_load(yaml_contents))
@@ -56,8 +69,7 @@ def main() -> None:
     config_uri = args["CONFIG_FILE"]
     source_layer = args["SOURCE_LAYER"]
     target_layer = args["TARGET_LAYER"]
-    if not config_uri.startswith("s3://"):
-        raise ValueError("CONFIG_FILE must start with s3://")
+    parse_s3_uri(config_uri)
     valid_layers = {"bronze", "silver", "gold"}
     if source_layer not in valid_layers or target_layer not in valid_layers:
         raise ValueError("SOURCE_LAYER and TARGET_LAYER must be bronze, silver, or gold")
