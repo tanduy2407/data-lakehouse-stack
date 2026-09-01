@@ -61,6 +61,39 @@ def write_parquet(dataframe, target_uri: str, mode) -> None:
     dataframe.write.mode(mode).parquet(target_uri)
 
 
+def register_catalog_table(
+    dataframe,
+    target_uri: str,
+    database: str,
+    table_name: str,
+) -> None:
+    # Spark's simpleString() output matches Hive/Glue column type syntax for primitives.
+    columns = [
+        {"Name": field.name, "Type": field.dataType.simpleString()}
+        for field in dataframe.schema.fields
+    ]
+    table_input = {
+        "Name": table_name,
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {"classification": "parquet"},
+        "StorageDescriptor": {
+            "Columns": columns,
+            "Location": target_uri,
+            "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+            "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+            "SerdeInfo": {
+                "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+            },
+        },
+    }
+
+    glue_client = boto3.client("glue")
+    try:
+        glue_client.update_table(DatabaseName=database, TableInput=table_input)
+    except glue_client.exceptions.EntityNotFoundException:
+        glue_client.create_table(DatabaseName=database, TableInput=table_input)
+
+
 def main() -> None:
     args = getResolvedOptions(
         sys.argv,
@@ -84,8 +117,14 @@ def main() -> None:
     source_uri = config[source_layer]["s3_uri"]
     target_config = config[target_layer]
     df = read_parquet(glue_context, source_uri)
-    write_parquet(
-        df, target_config["s3_uri"], target_config["write_mode"])
+    write_parquet(df, target_config["s3_uri"], target_config["write_mode"])
+
+    catalog_database = target_config.get("database")
+    catalog_table = target_config.get("table")
+    if catalog_database and catalog_table:
+        register_catalog_table(
+            df, target_config["s3_uri"], catalog_database, catalog_table)
+
     print(
         f"Wrote Parquet data from {source_uri} "
         f"to {target_config['s3_uri']}"
