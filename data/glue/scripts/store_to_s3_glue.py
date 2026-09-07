@@ -6,6 +6,7 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
+from pyspark.sql.functions import col, lpad
 import yaml
 
 
@@ -68,7 +69,7 @@ def load_s3_config(config_uri: str) -> dict:
 
 def read_parquet(
     glue_context: GlueContext,
-    folder_name: str,
+    folder_uri: str,
     year: str = None,
     month: str = None,
 ):
@@ -76,37 +77,47 @@ def read_parquet(
 
     Args:
         glue_context: Glue context used to read the data.
-        folder_name: S3 folder containing the Parquet data.
+        folder_uri: S3 folder containing the Parquet data.
         year: Optional partition year.
         month: Optional partition month.
     """
-    parse_s3_uri(folder_name)
+    parse_s3_uri(folder_uri)
     if (year is None) != (month is None):
         raise ValueError("year and month must be provided together")
 
-    folder_path = folder_name.rstrip("/")
+    folder_path = folder_uri.rstrip("/")
     if year is not None and month is not None:
         folder_path += f"/year={year}/month={str(month).zfill(2)}"
 
-    return glue_context.spark_session.read.parquet(folder_path)
+    return (
+        glue_context.spark_session.read
+        .option("basePath", folder_uri.rstrip("/"))
+        .format("parquet")
+        .load(folder_path)
+    )
 
 
-def write_parquet(dataframe, target_uri: str, mode, partition_by=None) -> None:
+def write_parquet(dataframe, target_uri: str, mode, partition_by: list = None) -> None:
     """Write a DataFrame to S3 as Parquet, optionally partitioned.
 
     Args:
         dataframe: DataFrame to write.
         target_uri: S3 destination folder.
         mode: Write mode, such as append or overwrite.
-        partition_by: Optional column name or list of column names.
+        partition_by: Optional list of column names.
     """
     write_op = dataframe.write.mode(mode)
     if partition_by:
-        # Accept both string and list; convert string to list
-        if isinstance(partition_by, str):
-            partition_by = [partition_by]
+        if not isinstance(partition_by, list):
+            raise ValueError("partition_by must be a list")
+        if "month" in partition_by:
+            # partitionBy writes raw values (6), not zero-padded (06)
+            dataframe = dataframe.withColumn(
+                "month", lpad(col("month").cast("string"), 2, "0")
+            )
+            write_op = dataframe.write.mode(mode)
         write_op = write_op.partitionBy(*partition_by)
-    write_op.parquet(target_uri)
+    write_op.format("parquet").save(target_uri)
 
 
 def register_catalog_table(
@@ -215,18 +226,17 @@ def register_catalog_partition(
 def main() -> None:
     args = getResolvedOptions(
         sys.argv,
-        ["JOB_NAME", "CONFIG_FILE", "TARGET_LAYER", "FOLDER_NAME"],
+        ["JOB_NAME", "CONFIG_FILE", "SOURCE_LAYER", "TARGET_LAYER"],
     )
-    optional_args = [name for name in ("YEAR", "MONTH") if f"--{name}" in sys.argv]
-    if optional_args:
-        args.update(getResolvedOptions(sys.argv, optional_args))
     config_uri = args["CONFIG_FILE"]
+    source_layer = args["SOURCE_LAYER"]
     target_layer = args["TARGET_LAYER"]
-    folder_name = args["FOLDER_NAME"]
-    partition_year = args.get("YEAR")
-    partition_month = args.get("MONTH")
+    partition_year = '2026'
+    partition_month = '09'
     parse_s3_uri(config_uri)
     valid_layers = {"bronze", "silver", "gold"}
+    if source_layer not in valid_layers:
+        raise ValueError("SOURCE_LAYER must be bronze, silver, or gold")
     if target_layer not in valid_layers:
         raise ValueError("TARGET_LAYER must be bronze, silver, or gold")
 
@@ -238,44 +248,46 @@ def main() -> None:
     job.init(args["JOB_NAME"], args)
 
     target_config = config[target_layer]
-    df = read_parquet(
-        glue_context, folder_name, partition_year, partition_month
-    )
-    partition_by = target_config.get("partition_by")
-    write_parquet(df, target_config["s3_uri"], target_config["write_mode"], partition_by)
+    source_uri = config[source_layer]["s3_uri"]
+    print(f"Source URI: {source_uri}")
+    df = read_parquet(glue_context, source_uri)
+    partition_by = ["year", "month"]
+    target_uri = target_config["s3_uri"]
+    print(f"Target URI: {target_uri}")
+    write_parquet(df, target_uri, target_config["write_mode"], partition_by)
 
-    catalog_database = target_config.get("database")
-    catalog_table = target_config.get("table")
-    if catalog_database and catalog_table:
-        register_catalog_table(
-            df,
-            target_config["s3_uri"],
-            catalog_database,
-            catalog_table,
-            partition_by,
-        )
-        if (
-            partition_year is not None
-            and partition_by == ["year", "month"]
-        ):
-            register_catalog_partition(
-                catalog_database,
-                catalog_table,
-                target_config["s3_uri"],
-                partition_year,
-                partition_month,
-                df,
-                partition_by,
-            )
+    # catalog_database = target_config.get("database")
+    # catalog_table = target_config.get("table")
+    # if catalog_database and catalog_table:
+    #     register_catalog_table(
+    #         df,
+    #         target_uri,
+    #         catalog_database,
+    #         catalog_table,
+    #         partition_by,
+    #     )
+    #     if (
+    #         partition_year is not None
+    #         and partition_by == ["year", "month"]
+    #     ):
+    #         register_catalog_partition(
+    #             catalog_database,
+    #             catalog_table,
+    #             target_uri,
+    #             partition_year,
+    #             partition_month,
+    #             df,
+    #             partition_by,
+    #         )
 
-    source_description = folder_name
-    if partition_year is not None:
-        source_description += (
-            f"/year={partition_year}/month={str(partition_month).zfill(2)}"
-        )
+    # source_description = source_layer
+    # if partition_year is not None:
+    #     source_description += (
+    #         f"/year={partition_year}/month={str(partition_month).zfill(2)}"
+    #     )
     print(
-        f"Wrote Parquet data from {source_description} "
-        f"to {target_config['s3_uri']}"
+        f"Wrote Parquet data from {source_layer} "
+        f"to {target_uri}"
     )
 
     job.commit()
