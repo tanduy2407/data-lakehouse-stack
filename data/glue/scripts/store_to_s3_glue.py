@@ -88,7 +88,6 @@ def read_parquet(
     folder_path = folder_uri.rstrip("/")
     if year is not None and month is not None:
         folder_path += f"/year={year}/month={str(month).zfill(2)}"
-
     return (
         glue_context.spark_session.read
         .option("basePath", folder_uri.rstrip("/"))
@@ -97,7 +96,7 @@ def read_parquet(
     )
 
 
-def write_parquet(dataframe, target_uri: str, mode, partition_by: list = None) -> None:
+def write_parquet(dataframe, target_uri: str, mode, partition_by: list[str] = None) -> None:
     """Write a DataFrame to S3 as Parquet, optionally partitioned.
 
     Args:
@@ -250,11 +249,12 @@ def main() -> None:
     target_config = config[target_layer]
     source_uri = config[source_layer]["s3_uri"]
     print(f"Source URI: {source_uri}")
-    df = read_parquet(glue_context, source_uri)
-    partition_by = ["year", "month"]
+    df = read_parquet(glue_context, source_uri, partition_year, partition_month)
+    print(f"Total rows: {df.count()}")
     target_uri = target_config["s3_uri"]
     print(f"Target URI: {target_uri}")
-    write_parquet(df, target_uri, target_config["write_mode"], partition_by)
+    partition_by = ["year", "month"]
+    # write_parquet(df, target_uri, target_config["write_mode"], partition_by)
 
     # catalog_database = target_config.get("database")
     # catalog_table = target_config.get("table")
@@ -285,10 +285,10 @@ def main() -> None:
     #     source_description += (
     #         f"/year={partition_year}/month={str(partition_month).zfill(2)}"
     #     )
-    print(
-        f"Wrote Parquet data from {source_layer} "
-        f"to {target_uri}"
-    )
+    # print(
+    #     f"Wrote Parquet data from {source_layer} "
+    #     f"to {target_uri}"
+    # )
 
     job.commit()
 
