@@ -11,18 +11,19 @@ from pyspark.sql.functions import col, lpad
 import yaml
 
 
-def parse_s3_uri(s3_uri: str) -> tuple:
+def _parse_s3_uri(s3_uri: str) -> tuple:
+    """Return the bucket and key from an S3 URI."""
     if not isinstance(s3_uri, str) or not s3_uri.startswith("s3://"):
         raise ValueError("S3 URI must start with s3://")
 
     bucket, separator, key = s3_uri.removeprefix("s3://").partition("/")
     if not bucket or not separator or not key:
         raise ValueError("S3 URI must include both a bucket and object key")
-
     return bucket, key
 
 
-def validate_config(config: dict) -> dict:
+def _validate_config(config: dict) -> dict:
+    """Validate the layer configuration."""
     if not isinstance(config, dict):
         raise ValueError("Configuration must be a YAML mapping")
 
@@ -38,7 +39,7 @@ def validate_config(config: dict) -> dict:
         if not isinstance(layer_config, dict):
             raise ValueError(f"{layer} must be a mapping")
         try:
-            parse_s3_uri(layer_config.get("s3_uri"))
+            _parse_s3_uri(layer_config.get("s3_uri"))
         except ValueError as error:
             raise ValueError(f"Invalid {layer}.s3_uri: {error}") from error
         if layer_config.get("write_mode") not in {"append", "overwrite", "error", "ignore"}:
@@ -62,34 +63,39 @@ def validate_config(config: dict) -> dict:
 
 
 def load_s3_config(config_uri: str) -> dict:
-    bucket, key = parse_s3_uri(config_uri)
+    """Load and validate YAML configuration from S3."""
+    bucket, key = _parse_s3_uri(config_uri)
     response = boto3.client("s3").get_object(Bucket=bucket, Key=key)
     yaml_contents = response["Body"].read().decode("utf-8")
-    return validate_config(yaml.safe_load(yaml_contents))
+    return _validate_config(yaml.safe_load(yaml_contents))
 
-def read_parquet(glue_context: GlueContext, folder_uri: str):
+### Parquet Reading Functions
+def read_parquet(glue_context: GlueContext, folder_uri: str) -> DataFrame:
     """Read all Parquet data from a folder.
 
     Args:
         glue_context: Glue context used to read the data.
         folder_uri: S3 folder containing the Parquet data.
     """
-    parse_s3_uri(folder_uri)
-    return glue_context.spark_session.read.format("parquet").load(folder_uri)
+    _parse_s3_uri(folder_uri)
+    print(f"Reading Parquet data from {folder_uri}")
+    try:
+        dataframe = glue_context.spark_session.read.format("parquet").load(folder_uri)
+        return dataframe
+    except Exception as error:
+        raise RuntimeError(
+            f"Failed to read Parquet data from {folder_uri}"
+        ) from error
 
 
-def validate_partitions(partitions: list[tuple[str, str]]) -> None:
+def _validate_partitions(partitions: list[tuple[str, str]]) -> None:
+    """Validate year/month partition values."""
     if not isinstance(partitions, list) or not partitions:
         raise ValueError("partitions must be a non-empty list")
 
     for partition in partitions:
-        if (
-            not isinstance(partition, tuple)
-            or len(partition) != 2
-        ):
-            raise ValueError(
-                "each partition must be a (year, month) tuple"
-            )
+        if not isinstance(partition, tuple) or len(partition) != 2:
+            raise ValueError("each partition must be a (year, month) tuple")
 
         year, month = partition
         if not isinstance(year, str) or not year.isdigit() or len(year) != 4:
@@ -100,8 +106,9 @@ def validate_partitions(partitions: list[tuple[str, str]]) -> None:
             raise ValueError("partition month must be between 1 and 12")
 
 
-def build_partitioned_folder_paths(partitions, base_path):
-    validate_partitions(partitions)
+def _build_partitioned_folder_paths(partitions, base_path):
+    """Build S3 paths for year/month partitions."""
+    _validate_partitions(partitions)
     folder_paths = [
         f"{base_path}/year={year}/month={str(month).zfill(2)}"
         for year, month in partitions
@@ -111,29 +118,40 @@ def build_partitioned_folder_paths(partitions, base_path):
 
 def read_partitioned_parquets(
     glue_context: GlueContext, folder_uri: str, partitions: list[tuple[str, str]]
-):
-    """Read Parquet data from multiple year/month partitions.
+) -> DataFrame:
+    """Read Parquet data from specific year/month partitions.
 
     Args:
         glue_context: Glue context used to read the data.
         folder_uri: S3 folder containing the Parquet data.
-        partitions: List of (year, month) tuples.
+        partitions: List of (year, month) tuples specifying the partitions to read.
     """
-    parse_s3_uri(folder_uri)
+    _parse_s3_uri(folder_uri)
     base_path = folder_uri.rstrip("/")
-    folder_paths = build_partitioned_folder_paths(partitions, base_path)
-    return (
-        glue_context.spark_session.read
-        .option("basePath", base_path)
-        .format("parquet")
-        .load(folder_paths)
+    folder_paths = _build_partitioned_folder_paths(partitions, base_path)
+    print(
+        f"Reading Parquet partitions {partitions} from {folder_uri}: "
+        f"{folder_paths}"
     )
+    try:
+        dataframe = (
+            glue_context.spark_session.read
+            .option("basePath", base_path)
+            .format("parquet")
+            .load(folder_paths)
+        )
+        return dataframe
+    except Exception as error:
+        raise RuntimeError(
+            f"Failed to read Parquet data from partitions in {folder_uri}"
+        ) from error
 
 
-def prepare_partition_columns(dataframe: DataFrame, partition_by: list[str]) -> DataFrame:
+### Parquet Writing Functions
+def _prepare_partition_columns(dataframe: DataFrame, partition_by: list[str]) -> DataFrame:
     """Validate partition columns and normalize year/month values."""
     if not isinstance(partition_by, list) or not all(
-        isinstance(column, str) for column in partition_by
+        isinstance(column, str) and column for column in partition_by
     ):
         raise ValueError("partition_by must be a list of strings")
 
@@ -171,6 +189,7 @@ def prepare_partition_columns(dataframe: DataFrame, partition_by: list[str]) -> 
         )
     return dataframe
 
+
 def write_parquet(dataframe: DataFrame, target_uri: str, mode: str) -> None:
     """Write a DataFrame to S3 as Parquet.
 
@@ -179,10 +198,16 @@ def write_parquet(dataframe: DataFrame, target_uri: str, mode: str) -> None:
         target_uri: S3 destination folder.
         mode: Write mode, such as append or overwrite.
     """
-    dataframe.write.mode(mode).format("parquet").save(target_uri)
+    print(f"Writing Parquet data to {target_uri} with mode={mode}")
+    try:
+        dataframe.write.mode(mode).format("parquet").save(target_uri)
+    except Exception as error:
+        raise RuntimeError(
+            f"Failed to write Parquet data to {target_uri}"
+        ) from error
 
     
-def write_partitioned_parquet(
+def write_partitioned_parquets(
     dataframe: DataFrame,
     target_uri: str,
     mode: str,
@@ -196,10 +221,19 @@ def write_partitioned_parquet(
         mode: Write mode, such as append or overwrite.
         partition_by: List of column names to partition by.
     """
-    dataframe = prepare_partition_columns(dataframe, partition_by)
-    dataframe.write.mode(mode).partitionBy(*partition_by).format("parquet").save(
-        target_uri
+    dataframe = _prepare_partition_columns(dataframe, partition_by)
+    print(
+        f"Writing partitioned Parquet data to {target_uri} "
+        f"with mode={mode}, partitions={partition_by}"
     )
+    try:
+        dataframe.write.mode(mode).partitionBy(*partition_by).format("parquet").save(
+            target_uri
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"Failed to write partitioned Parquet data to {target_uri}"
+        ) from error
 
 
 
@@ -318,7 +352,7 @@ def main() -> None:
     target_layer = args["TARGET_LAYER"]
     partition_year = '2026'
     partition_month = '09'
-    parse_s3_uri(config_uri)
+    _parse_s3_uri(config_uri)
     valid_layers = {"bronze", "silver", "gold"}
     if source_layer not in valid_layers:
         raise ValueError("SOURCE_LAYER must be bronze, silver, or gold")
@@ -335,8 +369,9 @@ def main() -> None:
     target_config = config[target_layer]
     source_uri = config[source_layer]["s3_uri"]
     print(f"Source URI: {source_uri}")
-    df = read_partitioned_parquet(
-        glue_context, source_uri, partition_year, partition_month
+    partitions = [(partition_year, partition_month)]
+    df = read_partitioned_parquets(
+        glue_context, source_uri, partitions
     )
     print(f"Total rows: {df.count()}")
     target_uri = target_config["s3_uri"]
