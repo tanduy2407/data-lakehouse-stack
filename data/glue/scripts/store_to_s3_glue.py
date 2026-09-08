@@ -6,6 +6,7 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
+from pyspark.sql import DataFrame
 from pyspark.sql.functions import col, lpad
 import yaml
 
@@ -66,57 +67,142 @@ def load_s3_config(config_uri: str) -> dict:
     yaml_contents = response["Body"].read().decode("utf-8")
     return validate_config(yaml.safe_load(yaml_contents))
 
-
-def read_parquet(
-    glue_context: GlueContext,
-    folder_uri: str,
-    year: str = None,
-    month: str = None,
-):
-    """Read Parquet data from a folder or a year/month partition.
+def read_parquet(glue_context: GlueContext, folder_uri: str):
+    """Read all Parquet data from a folder.
 
     Args:
         glue_context: Glue context used to read the data.
         folder_uri: S3 folder containing the Parquet data.
-        year: Optional partition year.
-        month: Optional partition month.
     """
     parse_s3_uri(folder_uri)
-    if (year is None) != (month is None):
-        raise ValueError("year and month must be provided together")
+    return glue_context.spark_session.read.format("parquet").load(folder_uri)
 
-    folder_path = folder_uri.rstrip("/")
-    if year is not None and month is not None:
-        folder_path += f"/year={year}/month={str(month).zfill(2)}"
+
+def validate_partitions(partitions: list[tuple[str, str]]) -> None:
+    if not isinstance(partitions, list) or not partitions:
+        raise ValueError("partitions must be a non-empty list")
+
+    for partition in partitions:
+        if (
+            not isinstance(partition, tuple)
+            or len(partition) != 2
+        ):
+            raise ValueError(
+                "each partition must be a (year, month) tuple"
+            )
+
+        year, month = partition
+        if not isinstance(year, str) or not year.isdigit() or len(year) != 4:
+            raise ValueError("partition year must be a four-digit string")
+        if not isinstance(month, str) or not month.isdigit():
+            raise ValueError("partition month must be a numeric string")
+        if not 1 <= int(month) <= 12:
+            raise ValueError("partition month must be between 1 and 12")
+
+
+def build_partitioned_folder_paths(partitions, base_path):
+    validate_partitions(partitions)
+    folder_paths = [
+        f"{base_path}/year={year}/month={str(month).zfill(2)}"
+        for year, month in partitions
+    ]
+    return folder_paths
+
+
+def read_partitioned_parquets(
+    glue_context: GlueContext, folder_uri: str, partitions: list[tuple[str, str]]
+):
+    """Read Parquet data from multiple year/month partitions.
+
+    Args:
+        glue_context: Glue context used to read the data.
+        folder_uri: S3 folder containing the Parquet data.
+        partitions: List of (year, month) tuples.
+    """
+    parse_s3_uri(folder_uri)
+    base_path = folder_uri.rstrip("/")
+    folder_paths = build_partitioned_folder_paths(partitions, base_path)
     return (
         glue_context.spark_session.read
-        .option("basePath", folder_uri.rstrip("/"))
+        .option("basePath", base_path)
         .format("parquet")
-        .load(folder_path)
+        .load(folder_paths)
     )
 
 
-def write_parquet(dataframe, target_uri: str, mode, partition_by: list[str] = None) -> None:
-    """Write a DataFrame to S3 as Parquet, optionally partitioned.
+def prepare_partition_columns(dataframe: DataFrame, partition_by: list[str]) -> DataFrame:
+    """Validate partition columns and normalize year/month values."""
+    if not isinstance(partition_by, list) or not all(
+        isinstance(column, str) for column in partition_by
+    ):
+        raise ValueError("partition_by must be a list of strings")
+
+    if not partition_by:
+        raise ValueError("partition_by must not be empty")
+
+    missing_columns = set(partition_by) - set(dataframe.columns)
+    if missing_columns:
+        raise ValueError(
+            "Partition columns not found in DataFrame: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    if "year" in partition_by:
+        invalid_years = dataframe.filter(
+            col("year").isNull()
+            | ~col("year").cast("string").rlike(r"^\d{4}$")
+        ).limit(1).count()
+
+        if invalid_years:
+            raise ValueError("year partition values must be four-digit values")
+
+    if "month" in partition_by:
+        invalid_months = dataframe.filter(
+            col("month").isNull()
+            | ~col("month").cast("string").rlike(r"^(0?[1-9]|1[0-2])$")
+        ).limit(1).count()
+
+        if invalid_months:
+            raise ValueError("month partition values must be between 1 and 12")
+
+        dataframe = dataframe.withColumn(
+            "month",
+            lpad(col("month").cast("string"), 2, "0"),
+        )
+    return dataframe
+
+def write_parquet(dataframe: DataFrame, target_uri: str, mode: str) -> None:
+    """Write a DataFrame to S3 as Parquet.
 
     Args:
         dataframe: DataFrame to write.
         target_uri: S3 destination folder.
         mode: Write mode, such as append or overwrite.
-        partition_by: Optional list of column names.
     """
-    write_op = dataframe.write.mode(mode)
-    if partition_by:
-        if not isinstance(partition_by, list):
-            raise ValueError("partition_by must be a list")
-        if "month" in partition_by:
-            # partitionBy writes raw values (6), not zero-padded (06)
-            dataframe = dataframe.withColumn(
-                "month", lpad(col("month").cast("string"), 2, "0")
-            )
-            write_op = dataframe.write.mode(mode)
-        write_op = write_op.partitionBy(*partition_by)
-    write_op.format("parquet").save(target_uri)
+    dataframe.write.mode(mode).format("parquet").save(target_uri)
+
+    
+def write_partitioned_parquet(
+    dataframe: DataFrame,
+    target_uri: str,
+    mode: str,
+    partition_by: list[str],
+) -> None:
+    """Write a DataFrame to S3 as Parquet, partitioned by columns.
+
+    Args:
+        dataframe: DataFrame to write.
+        target_uri: S3 destination folder.
+        mode: Write mode, such as append or overwrite.
+        partition_by: List of column names to partition by.
+    """
+    dataframe = prepare_partition_columns(dataframe, partition_by)
+    dataframe.write.mode(mode).partitionBy(*partition_by).format("parquet").save(
+        target_uri
+    )
+
+
+
 
 
 def register_catalog_table(
@@ -249,12 +335,14 @@ def main() -> None:
     target_config = config[target_layer]
     source_uri = config[source_layer]["s3_uri"]
     print(f"Source URI: {source_uri}")
-    df = read_parquet(glue_context, source_uri, partition_year, partition_month)
+    df = read_partitioned_parquet(
+        glue_context, source_uri, partition_year, partition_month
+    )
     print(f"Total rows: {df.count()}")
     target_uri = target_config["s3_uri"]
     print(f"Target URI: {target_uri}")
     partition_by = ["year", "month"]
-    # write_parquet(df, target_uri, target_config["write_mode"], partition_by)
+    # write_partitioned_parquet(df, target_uri, target_config["write_mode"], partition_by)
 
     # catalog_database = target_config.get("database")
     # catalog_table = target_config.get("table")
