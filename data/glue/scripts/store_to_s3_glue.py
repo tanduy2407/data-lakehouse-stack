@@ -27,6 +27,10 @@ def _validate_config(config: dict) -> dict:
     if not isinstance(config, dict):
         raise ValueError("Configuration must be a YAML mapping")
 
+    region = config.get("region")
+    if region is not None and (not isinstance(region, str) or not region):
+        raise ValueError("region must be a non-empty string")
+
     required_keys = {"bronze", "silver", "gold"}
     missing_keys = required_keys - config.keys()
     if missing_keys:
@@ -68,6 +72,14 @@ def load_s3_config(config_uri: str) -> dict:
     response = boto3.client("s3").get_object(Bucket=bucket, Key=key)
     yaml_contents = response["Body"].read().decode("utf-8")
     return _validate_config(yaml.safe_load(yaml_contents))
+
+
+def _get_glue_client(region: str = None):
+    """Create a Glue client using the configured or default AWS Region."""
+    if region:
+        return boto3.client("glue", region_name=region)
+    return boto3.client("glue")
+
 
 ### Parquet Reading Functions
 def read_parquet(glue_context: GlueContext, folder_uri: str) -> DataFrame:
@@ -244,13 +256,10 @@ def register_catalog_table(
     target_uri: str,
     database: str,
     table_name: str,
-    partition_by=None,
+    partition_by: list[str],
+    region: str = None,
 ) -> None:
     """Create or update a Glue table definition."""
-    if isinstance(partition_by, str):
-        partition_by = [partition_by]
-    partition_by = partition_by or []
-
     fields = {field.name: field for field in dataframe.schema.fields}
     missing_partitions = set(partition_by) - fields.keys()
     if missing_partitions:
@@ -284,7 +293,7 @@ def register_catalog_table(
         },
     }
 
-    glue_client = boto3.client("glue")
+    glue_client = _get_glue_client(region)
     try:
         glue_client.update_table(DatabaseName=database, TableInput=table_input)
     except glue_client.exceptions.EntityNotFoundException:
@@ -295,26 +304,32 @@ def register_catalog_partition(
     database: str,
     table_name: str,
     target_uri: str,
-    year: str,
-    month: str,
     dataframe,
-    partition_by=None,
+    partition_by: list[str],
+    partition_values: dict[str, object],
+    region: str = None,
 ) -> None:
-    """Create or update one year/month partition in Glue Catalog."""
-    if isinstance(partition_by, str):
-        partition_by = [partition_by]
-    partition_by = partition_by or ["year", "month"]
-    partition_month = str(month).zfill(2)
-    partition_uri = (
-        f"{target_uri.rstrip('/')}/year={year}/month={partition_month}"
-    )
+    """Create or update one partition in Glue Catalog."""
+    if set(partition_by) != set(partition_values):
+        raise ValueError("partition values must match partition_by")
+
+    partition_uri = target_uri.rstrip("/")
+    values = []
+    for column in partition_by:
+        value = str(partition_values[column])
+        if column == "month":
+            value = value.zfill(2)
+        partition_uri += f"/{column}={value}"
+        values.append(value)
+
     columns = [
         {"Name": field.name, "Type": field.dataType.simpleString()}
         for field in dataframe.schema.fields
         if field.name not in partition_by
     ]
     partition = {
-        "Values": [str(year), partition_month],
+        "Values": values,
+        "Parameters": {"classification": "parquet"},
         "StorageDescriptor": {
             "Columns": columns,
             "Location": partition_uri,
@@ -326,7 +341,7 @@ def register_catalog_partition(
         },
     }
 
-    glue_client = boto3.client("glue")
+    glue_client = _get_glue_client(region)
     try:
         glue_client.update_partition(
             DatabaseName=database,
@@ -342,6 +357,37 @@ def register_catalog_partition(
         )
 
 
+def register_catalog_partitions(
+    database: str,
+    table_name: str,
+    target_uri: str,
+    dataframe: DataFrame,
+    partition_by: list[str],
+    region: str = None,
+) -> None:
+    """Register all distinct DataFrame partitions in Glue Catalog."""
+    if not partition_by:
+        raise ValueError("partition_by is required to register partitions")
+
+    partitions = [
+        {column: row[column] for column in partition_by}
+        for row in dataframe.select(*partition_by).distinct().collect()
+    ]
+    for partition_values in sorted(
+        partitions,
+        key=lambda values: tuple(str(values[column]) for column in partition_by),
+    ):
+        register_catalog_partition(
+            database,
+            table_name,
+            target_uri,
+            dataframe,
+            partition_by,
+            partition_values,
+            region,
+        )
+
+
 def main() -> None:
     args = getResolvedOptions(
         sys.argv,
@@ -350,8 +396,6 @@ def main() -> None:
     config_uri = args["CONFIG_FILE"]
     source_layer = args["SOURCE_LAYER"]
     target_layer = args["TARGET_LAYER"]
-    partition_year = '2026'
-    partition_month = '09'
     _parse_s3_uri(config_uri)
     valid_layers = {"bronze", "silver", "gold"}
     if source_layer not in valid_layers:
@@ -361,6 +405,8 @@ def main() -> None:
 
     print(f"Loading configuration from {config_uri}")
     config = load_s3_config(config_uri)
+    catalog_region = config.get("region")
+    print(f"Glue Catalog region: {catalog_region or 'job default'}")
 
     glue_context = GlueContext(SparkContext.getOrCreate())
     job = Job(glue_context)
@@ -369,50 +415,43 @@ def main() -> None:
     target_config = config[target_layer]
     source_uri = config[source_layer]["s3_uri"]
     print(f"Source URI: {source_uri}")
-    partitions = [(partition_year, partition_month)]
-    df = read_partitioned_parquets(
-        glue_context, source_uri, partitions
+    df = read_parquet(
+        glue_context, source_uri
     )
     print(f"Total rows: {df.count()}")
     target_uri = target_config["s3_uri"]
     print(f"Target URI: {target_uri}")
-    partition_by = ["year", "month"]
-    # write_partitioned_parquet(df, target_uri, target_config["write_mode"], partition_by)
+    partition_by = target_config.get("partition_by")
+    if isinstance(partition_by, str):
+        partition_by = [partition_by]
+    if partition_by:
+        write_partitioned_parquets(
+            df, target_uri, target_config["write_mode"], partition_by
+        )
+    else:
+        write_parquet(df, target_uri, target_config["write_mode"])
 
-    # catalog_database = target_config.get("database")
-    # catalog_table = target_config.get("table")
-    # if catalog_database and catalog_table:
-    #     register_catalog_table(
-    #         df,
-    #         target_uri,
-    #         catalog_database,
-    #         catalog_table,
-    #         partition_by,
-    #     )
-    #     if (
-    #         partition_year is not None
-    #         and partition_by == ["year", "month"]
-    #     ):
-    #         register_catalog_partition(
-    #             catalog_database,
-    #             catalog_table,
-    #             target_uri,
-    #             partition_year,
-    #             partition_month,
-    #             df,
-    #             partition_by,
-    #         )
-
-    # source_description = source_layer
-    # if partition_year is not None:
-    #     source_description += (
-    #         f"/year={partition_year}/month={str(partition_month).zfill(2)}"
-    #     )
-    # print(
-    #     f"Wrote Parquet data from {source_layer} "
-    #     f"to {target_uri}"
-    # )
-
+    catalog_database = target_config.get("database")
+    catalog_table = target_config.get("table")
+    if catalog_database and catalog_table:
+        catalog_partition_by = partition_by or []
+        register_catalog_table(
+            df,
+            target_uri,
+            catalog_database,
+            catalog_table,
+            catalog_partition_by,
+            catalog_region,
+        )
+        if catalog_partition_by:
+            register_catalog_partitions(
+                catalog_database,
+                catalog_table,
+                target_uri,
+                df,
+                catalog_partition_by,
+                catalog_region,
+            )
     job.commit()
 
 
