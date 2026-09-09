@@ -100,47 +100,80 @@ def read_parquet(glue_context: GlueContext, folder_uri: str) -> DataFrame:
         ) from error
 
 
-def _validate_partitions(partitions: list[tuple[str, str]]) -> None:
-    """Validate year/month partition values."""
+def _validate_partitions(partitions: list[dict[str, object]]) -> None:
+    """Validate partition dictionaries."""
     if not isinstance(partitions, list) or not partitions:
         raise ValueError("partitions must be a non-empty list")
 
     for partition in partitions:
-        if not isinstance(partition, tuple) or len(partition) != 2:
-            raise ValueError("each partition must be a (year, month) tuple")
-
-        year, month = partition
-        if not isinstance(year, str) or not year.isdigit() or len(year) != 4:
-            raise ValueError("partition year must be a four-digit string")
-        if not isinstance(month, str) or not month.isdigit():
-            raise ValueError("partition month must be a numeric string")
-        if not 1 <= int(month) <= 12:
-            raise ValueError("partition month must be between 1 and 12")
+        if not isinstance(partition, dict) or not partition:
+            raise ValueError("each partition must be a non-empty dictionary")
 
 
-def _build_partitioned_folder_paths(partitions, base_path):
-    """Build S3 paths for year/month partitions."""
+def _validate_partition_values(
+    partition_by: list[str], partition_values: dict[str, object]
+) -> None:
+    """Validate partition values for configured keys."""
+    if not isinstance(partition_by, list) or not partition_by:
+        raise ValueError("partition_by must be a non-empty list")
+    if not isinstance(partition_values, dict):
+        raise ValueError("partition values must be a dictionary")
+    if set(partition_by) != set(partition_values):
+        raise ValueError("partition values must match partition_by")
+
+    if "year" in partition_by:
+        year = str(partition_values["year"])
+        if len(year) != 4 or not year.isdigit():
+            raise ValueError("year partition values must be four-digit values")
+
+    if "month" in partition_by:
+        month = str(partition_values["month"])
+        if not month.isdigit() or not 1 <= int(month) <= 12:
+            raise ValueError("month partition values must be between 1 and 12")
+
+
+def _build_partitioned_folder_paths(
+    base_path: str,
+    partition_by: list[str],
+    partitions: list[dict[str, object]],
+) -> list[str]:
+    """Build S3 paths from partition values and key order."""
     _validate_partitions(partitions)
-    folder_paths = [
-        f"{base_path}/year={year}/month={str(month).zfill(2)}"
-        for year, month in partitions
-    ]
+    if not partition_by:
+        raise ValueError("partition_by is required")
+
+    folder_paths = []
+    for partition in partitions:
+        _validate_partition_values(partition_by, partition)
+        path = base_path.rstrip("/")
+        for column in partition_by:
+            value = str(partition[column])
+            if column == "month":
+                value = value.zfill(2)
+            path += f"/{column}={value}"
+        folder_paths.append(path)
     return folder_paths
 
 
 def read_partitioned_parquets(
-    glue_context: GlueContext, folder_uri: str, partitions: list[tuple[str, str]]
+    glue_context: GlueContext,
+    folder_uri: str,
+    partitions: list[dict[str, object]],
+    partition_by: list[str],
 ) -> DataFrame:
     """Read Parquet data from specific year/month partitions.
 
     Args:
         glue_context: Glue context used to read the data.
         folder_uri: S3 folder containing the Parquet data.
-        partitions: List of (year, month) tuples specifying the partitions to read.
+        partitions: Partition dictionaries specifying the values to read.
+        partition_by: Ordered partition column names.
     """
     _parse_s3_uri(folder_uri)
     base_path = folder_uri.rstrip("/")
-    folder_paths = _build_partitioned_folder_paths(partitions, base_path)
+    folder_paths = _build_partitioned_folder_paths(
+        base_path, partition_by, partitions
+    )
     print(
         f"Reading Parquet partitions {partitions} from {folder_uri}: "
         f"{folder_paths}"
@@ -310,8 +343,7 @@ def register_catalog_partition(
     region: str = None,
 ) -> None:
     """Create or update one partition in Glue Catalog."""
-    if set(partition_by) != set(partition_values):
-        raise ValueError("partition values must match partition_by")
+    _validate_partition_values(partition_by, partition_values)
 
     partition_uri = target_uri.rstrip("/")
     values = []
