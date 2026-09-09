@@ -101,7 +101,7 @@ def read_parquet(glue_context: GlueContext, folder_uri: str) -> DataFrame:
 
 
 def _validate_partitions(partitions: list[dict[str, object]]) -> None:
-    """Validate partition dictionaries."""
+    """Validate the partition dictionary list structure."""
     if not isinstance(partitions, list) or not partitions:
         raise ValueError("partitions must be a non-empty list")
 
@@ -113,7 +113,7 @@ def _validate_partitions(partitions: list[dict[str, object]]) -> None:
 def _validate_partition_values(
     partition_by: list[str], partition_values: dict[str, object]
 ) -> None:
-    """Validate partition values for configured keys."""
+    """Validate one partition against its configured keys."""
     if not isinstance(partition_by, list) or not partition_by:
         raise ValueError("partition_by must be a non-empty list")
     if not isinstance(partition_values, dict):
@@ -132,12 +132,20 @@ def _validate_partition_values(
             raise ValueError("month partition values must be between 1 and 12")
 
 
+def _normalize_partition_value(column: str, value: object) -> str:
+    """Return the canonical string form of a partition value."""
+    normalized_value = str(value)
+    if column == "month":
+        return normalized_value.zfill(2)
+    return normalized_value
+
+
 def _build_partitioned_folder_paths(
     base_path: str,
     partition_by: list[str],
     partitions: list[dict[str, object]],
 ) -> list[str]:
-    """Build S3 paths from partition values and key order."""
+    """Build S3 paths from ordered partition keys and values."""
     _validate_partitions(partitions)
     if not partition_by:
         raise ValueError("partition_by is required")
@@ -147,9 +155,7 @@ def _build_partitioned_folder_paths(
         _validate_partition_values(partition_by, partition)
         path = base_path.rstrip("/")
         for column in partition_by:
-            value = str(partition[column])
-            if column == "month":
-                value = value.zfill(2)
+            value = _normalize_partition_value(column, partition[column])
             path += f"/{column}={value}"
         folder_paths.append(path)
     return folder_paths
@@ -161,13 +167,13 @@ def read_partitioned_parquets(
     partitions: list[dict[str, object]],
     partition_by: list[str],
 ) -> DataFrame:
-    """Read Parquet data from specific year/month partitions.
+    """Read Parquet data from specific configured partitions.
 
     Args:
         glue_context: Glue context used to read the data.
         folder_uri: S3 folder containing the Parquet data.
-        partitions: Partition dictionaries specifying the values to read.
-        partition_by: Ordered partition column names.
+        partitions: Partition dictionaries specifying values to read.
+        partition_by: Ordered partition column names used in each path.
     """
     _parse_s3_uri(folder_uri)
     base_path = folder_uri.rstrip("/")
@@ -342,15 +348,19 @@ def register_catalog_partition(
     partition_values: dict[str, object],
     region: str = None,
 ) -> None:
-    """Create or update one partition in Glue Catalog."""
+    """Create or update one configured partition in Glue Catalog.
+
+    Args:
+        partition_by: Ordered partition column names.
+        partition_values: Values for the configured partition columns.
+        region: Optional AWS Region for the Glue Catalog.
+    """
     _validate_partition_values(partition_by, partition_values)
 
     partition_uri = target_uri.rstrip("/")
     values = []
     for column in partition_by:
-        value = str(partition_values[column])
-        if column == "month":
-            value = value.zfill(2)
+        value = _normalize_partition_value(column, partition_values[column])
         partition_uri += f"/{column}={value}"
         values.append(value)
 
@@ -397,7 +407,12 @@ def register_catalog_partitions(
     partition_by: list[str],
     region: str = None,
 ) -> None:
-    """Register all distinct DataFrame partitions in Glue Catalog."""
+    """Register all distinct DataFrame partitions in Glue Catalog.
+
+    Args:
+        partition_by: Partition columns to discover and register.
+        region: Optional AWS Region for the Glue Catalog.
+    """
     if not partition_by:
         raise ValueError("partition_by is required to register partitions")
 
