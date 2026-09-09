@@ -74,12 +74,6 @@ def load_s3_config(config_uri: str) -> dict:
     return _validate_config(yaml.safe_load(yaml_contents))
 
 
-def _get_glue_client(region: str = None):
-    """Create a Glue client using the configured or default AWS Region."""
-    if region:
-        return boto3.client("glue", region_name=region)
-    return boto3.client("glue")
-
 
 ### Parquet Reading Functions
 def read_parquet(glue_context: GlueContext, folder_uri: str) -> DataFrame:
@@ -181,8 +175,8 @@ def read_partitioned_parquets(
         base_path, partition_by, partitions
     )
     print(
-        f"Reading Parquet partitions {partitions} from {folder_uri}: "
-        f"{folder_paths}"
+        f"Reading Parquet partitions from {folder_uri} "
+        f"with keys={partition_by}, values={partitions}: {folder_paths}"
     )
     try:
         dataframe = (
@@ -200,7 +194,7 @@ def read_partitioned_parquets(
 
 ### Parquet Writing Functions
 def _prepare_partition_columns(dataframe: DataFrame, partition_by: list[str]) -> DataFrame:
-    """Validate partition columns and normalize year/month values."""
+    """Validate partition columns and normalize values."""
     if not isinstance(partition_by, list) or not all(
         isinstance(column, str) and column for column in partition_by
     ):
@@ -289,150 +283,197 @@ def write_partitioned_parquets(
 
 
 
+### Glue Catalog Functions
+class GlueCatalogManager:
+    """Manage Glue Catalog tables and partitions with one client."""
 
-def register_catalog_table(
-    dataframe,
-    target_uri: str,
-    database: str,
-    table_name: str,
-    partition_by: list[str],
-    region: str = None,
-) -> None:
-    """Create or update a Glue table definition."""
-    fields = {field.name: field for field in dataframe.schema.fields}
-    missing_partitions = set(partition_by) - fields.keys()
-    if missing_partitions:
-        raise ValueError(
-            "Partition columns not found in DataFrame: "
-            + ", ".join(sorted(missing_partitions))
-        )
+    def __init__(self, region: str = None):
+        self.glue_client = boto3.client("glue", region_name=region)
 
-    columns = [
-        {"Name": field.name, "Type": field.dataType.simpleString()}
-        for field in dataframe.schema.fields
-        if field.name not in partition_by
-    ]
-    partition_keys = [
-        {"Name": name, "Type": fields[name].dataType.simpleString()}
-        for name in partition_by
-    ]
-    table_input = {
-        "Name": table_name,
-        "TableType": "EXTERNAL_TABLE",
-        "Parameters": {"classification": "parquet"},
-        "PartitionKeys": partition_keys,
-        "StorageDescriptor": {
-            "Columns": columns,
-            "Location": target_uri,
-            "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
-            "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
-            "SerdeInfo": {
-                "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+    @staticmethod
+    def _map_pyspark_type_to_glue(pyspark_type_str: str) -> str:
+        """Map PySpark types that require a Glue Catalog type name."""
+        type_mapping = {
+            "timestampntz": "timestamp",
+            "byte": "tinyint",
+            "short": "smallint",
+            "long": "bigint",
+        }
+        normalized = pyspark_type_str.lower()
+        return type_mapping.get(normalized, pyspark_type_str)
+
+    def _validate_database(self, database_name: str) -> None:
+        """Ensure that the Glue database exists."""
+        try:
+            self.glue_client.get_database(Name=database_name)
+        except self.glue_client.exceptions.EntityNotFoundException as error:
+            raise ValueError(
+                f"Glue database does not exist: {database_name}"
+            ) from error
+
+    def _validate_table(self, database_name: str, table_name: str) -> None:
+        """Ensure that the Glue table exists in the specified database."""
+        self._validate_database(database_name)
+        try:
+            self.glue_client.get_table(
+                DatabaseName=database_name,
+                Name=table_name,
+            )
+        except self.glue_client.exceptions.EntityNotFoundException as error:
+            raise ValueError(
+                f"Glue table does not exist: {database_name}.{table_name}"
+            ) from error
+
+    def register_table(
+        self,
+        dataframe,
+        target_uri: str,
+        database_name: str,
+        table_name: str,
+        partition_by: list[str],
+    ) -> None:
+        """Create or update a Glue table definition."""
+        self._validate_database(database_name)
+        fields = {field.name: field for field in dataframe.schema.fields}
+        missing_partitions = set(partition_by) - fields.keys()
+        if missing_partitions:
+            raise ValueError(
+                "Partition columns not found in DataFrame: "
+                + ", ".join(sorted(missing_partitions))
+            )
+
+        columns = [
+            {
+                "Name": field.name,
+                "Type": self._map_pyspark_type_to_glue(
+                    field.dataType.simpleString()
+                ),
+            }
+            for field in dataframe.schema.fields
+            if field.name not in partition_by
+        ]
+        partition_keys = [
+            {
+                "Name": name,
+                "Type": self._map_pyspark_type_to_glue(
+                    fields[name].dataType.simpleString()
+                ),
+            }
+            for name in partition_by
+        ]
+        table_input = {
+            "Name": table_name,
+            "TableType": "EXTERNAL_TABLE",
+            "Parameters": {"classification": "parquet"},
+            "PartitionKeys": partition_keys,
+            "StorageDescriptor": {
+                "Columns": columns,
+                "Location": target_uri,
+                "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+                "SerdeInfo": {
+                    "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+                },
             },
-        },
-    }
+        }
+        try:
+            self.glue_client.update_table(
+                DatabaseName=database_name,
+                TableInput=table_input,
+            )
+        except self.glue_client.exceptions.EntityNotFoundException:
+            self.glue_client.create_table(
+                DatabaseName=database_name,
+                TableInput=table_input,
+            )
 
-    glue_client = _get_glue_client(region)
-    try:
-        glue_client.update_table(DatabaseName=database, TableInput=table_input)
-    except glue_client.exceptions.EntityNotFoundException:
-        glue_client.create_table(DatabaseName=database, TableInput=table_input)
+    def _register_partition(
+        self,
+        database_name: str,
+        table_name: str,
+        target_uri: str,
+        dataframe,
+        partition_by: list[str],
+        partition_values: dict[str, object],
+    ) -> None:
+        """Create or update one partition."""
+        _validate_partition_values(partition_by, partition_values)
 
+        partition_uri = target_uri.rstrip("/")
+        values = []
+        for column in partition_by:
+            value = _normalize_partition_value(column, partition_values[column])
+            partition_uri += f"/{column}={value}"
+            values.append(value)
 
-def register_catalog_partition(
-    database: str,
-    table_name: str,
-    target_uri: str,
-    dataframe,
-    partition_by: list[str],
-    partition_values: dict[str, object],
-    region: str = None,
-) -> None:
-    """Create or update one configured partition in Glue Catalog.
-
-    Args:
-        partition_by: Ordered partition column names.
-        partition_values: Values for the configured partition columns.
-        region: Optional AWS Region for the Glue Catalog.
-    """
-    _validate_partition_values(partition_by, partition_values)
-
-    partition_uri = target_uri.rstrip("/")
-    values = []
-    for column in partition_by:
-        value = _normalize_partition_value(column, partition_values[column])
-        partition_uri += f"/{column}={value}"
-        values.append(value)
-
-    columns = [
-        {"Name": field.name, "Type": field.dataType.simpleString()}
-        for field in dataframe.schema.fields
-        if field.name not in partition_by
-    ]
-    partition = {
-        "Values": values,
-        "Parameters": {"classification": "parquet"},
-        "StorageDescriptor": {
-            "Columns": columns,
-            "Location": partition_uri,
-            "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
-            "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
-            "SerdeInfo": {
-                "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+        columns = [
+            {
+                "Name": field.name,
+                "Type": self._map_pyspark_type_to_glue(
+                    field.dataType.simpleString()
+                ),
+            }
+            for field in dataframe.schema.fields
+            if field.name not in partition_by
+        ]
+        partition = {
+            "Values": values,
+            "Parameters": {"classification": "parquet"},
+            "StorageDescriptor": {
+                "Columns": columns,
+                "Location": partition_uri,
+                "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+                "SerdeInfo": {
+                    "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+                },
             },
-        },
-    }
+        }
+        try:
+            self.glue_client.update_partition(
+                DatabaseName=database_name,
+                TableName=table_name,
+                PartitionValueList=partition["Values"],
+                PartitionInput=partition,
+            )
+        except self.glue_client.exceptions.EntityNotFoundException:
+            self.glue_client.create_partition(
+                DatabaseName=database_name,
+                TableName=table_name,
+                PartitionInput=partition,
+            )
 
-    glue_client = _get_glue_client(region)
-    try:
-        glue_client.update_partition(
-            DatabaseName=database,
-            TableName=table_name,
-            PartitionValueList=partition["Values"],
-            PartitionInput=partition,
-        )
-    except glue_client.exceptions.EntityNotFoundException:
-        glue_client.create_partition(
-            DatabaseName=database,
-            TableName=table_name,
-            PartitionInput=partition,
-        )
+    def register_partitions(
+        self,
+        database_name: str,
+        table_name: str,
+        target_uri: str,
+        dataframe: DataFrame,
+        partition_by: list[str],
+    ) -> None:
+        """Register all distinct DataFrame partitions in Glue Catalog."""
+        if not partition_by:
+            raise ValueError("partition_by is required to register partitions")
 
-
-def register_catalog_partitions(
-    database: str,
-    table_name: str,
-    target_uri: str,
-    dataframe: DataFrame,
-    partition_by: list[str],
-    region: str = None,
-) -> None:
-    """Register all distinct DataFrame partitions in Glue Catalog.
-
-    Args:
-        partition_by: Partition columns to discover and register.
-        region: Optional AWS Region for the Glue Catalog.
-    """
-    if not partition_by:
-        raise ValueError("partition_by is required to register partitions")
-
-    partitions = [
-        {column: row[column] for column in partition_by}
-        for row in dataframe.select(*partition_by).distinct().collect()
-    ]
-    for partition_values in sorted(
-        partitions,
-        key=lambda values: tuple(str(values[column]) for column in partition_by),
-    ):
-        register_catalog_partition(
-            database,
-            table_name,
-            target_uri,
-            dataframe,
-            partition_by,
-            partition_values,
-            region,
-        )
+        self._validate_table(database_name, table_name)
+        partitions = [
+            {column: row[column] for column in partition_by}
+            for row in dataframe.select(*partition_by).distinct().collect()
+        ]
+        for partition_values in sorted(
+            partitions,
+            key=lambda values: tuple(
+                str(values[column]) for column in partition_by
+            ),
+        ):
+            self._register_partition(
+                database_name,
+                table_name,
+                target_uri,
+                dataframe,
+                partition_by,
+                partition_values,
+            )
 
 
 def main() -> None:
@@ -478,26 +519,25 @@ def main() -> None:
     else:
         write_parquet(df, target_uri, target_config["write_mode"])
 
-    catalog_database = target_config.get("database")
+    catalog_database_name = target_config.get("database")
     catalog_table = target_config.get("table")
-    if catalog_database and catalog_table:
+    if catalog_database_name and catalog_table:
         catalog_partition_by = partition_by or []
-        register_catalog_table(
+        catalog_manager = GlueCatalogManager(catalog_region)
+        catalog_manager.register_table(
             df,
             target_uri,
-            catalog_database,
+            catalog_database_name,
             catalog_table,
             catalog_partition_by,
-            catalog_region,
         )
         if catalog_partition_by:
-            register_catalog_partitions(
-                catalog_database,
+            catalog_manager.register_partitions(
+                catalog_database_name,
                 catalog_table,
                 target_uri,
                 df,
                 catalog_partition_by,
-                catalog_region,
             )
     job.commit()
 
