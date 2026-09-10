@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import logging
 import sys
 
 import boto3
@@ -9,6 +10,9 @@ from pyspark.context import SparkContext
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import col, lpad
 import yaml
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def _parse_s3_uri(s3_uri: str) -> tuple:
@@ -84,7 +88,7 @@ def read_parquet(glue_context: GlueContext, folder_uri: str) -> DataFrame:
         folder_uri: S3 folder containing the Parquet data.
     """
     _parse_s3_uri(folder_uri)
-    print(f"Reading Parquet data from {folder_uri}")
+    logger.info("Reading Parquet data from %s", folder_uri)
     try:
         dataframe = glue_context.spark_session.read.format("parquet").load(folder_uri)
         return dataframe
@@ -166,9 +170,9 @@ def read_partitioned_parquets(
     folder_paths = _build_partitioned_folder_paths(
         base_path, partition_by, partitions
     )
-    print(
-        f"Reading Parquet partitions from {folder_uri} "
-        f"with keys={partition_by}, values={partitions}: {folder_paths}"
+    logger.info(
+        "Reading Parquet partitions from %s with keys=%s, values=%s: %s",
+        folder_uri, partition_by, partitions, folder_paths,
     )
     try:
         dataframe = (
@@ -235,7 +239,7 @@ def write_parquet(dataframe: DataFrame, target_uri: str, mode: str) -> None:
         target_uri: S3 destination folder.
         mode: Write mode, such as append or overwrite.
     """
-    print(f"Writing Parquet data to {target_uri} with mode={mode}")
+    logger.info("Writing Parquet data to %s with mode=%s", target_uri, mode)
     try:
         dataframe.write.mode(mode).format("parquet").save(target_uri)
     except Exception as error:
@@ -259,9 +263,9 @@ def write_partitioned_parquets(
         partition_by: List of column names to partition by.
     """
     dataframe = _prepare_partition_columns(dataframe, partition_by)
-    print(
-        f"Writing partitioned Parquet data to {target_uri} "
-        f"with mode={mode}, partitions={partition_by}"
+    logger.info(
+        "Writing partitioned Parquet data to %s with mode=%s, partitions=%s",
+        target_uri, mode, partition_by,
     )
     try:
         dataframe.write.mode(mode).partitionBy(*partition_by).format("parquet").save(
@@ -287,7 +291,7 @@ class GlueCatalogManager:
     def _map_pyspark_type_to_glue(pyspark_type_str: str) -> str:
         """Map PySpark types that require a Glue Catalog type name."""
         type_mapping = {
-            "timestampntz": "timestamp",
+            "timestamp_ntz": "timestamp",
             "byte": "tinyint",
             "short": "smallint",
             "long": "bigint",
@@ -392,13 +396,13 @@ class GlueCatalogManager:
                 DatabaseName=database_name,
                 TableInput=table_input,
             )
-            print(f"Updated Glue table: {database_name}.{table_name}")
+            logger.info("Updated Glue table: %s.%s", database_name, table_name)
         except self.glue_client.exceptions.EntityNotFoundException:
             self.glue_client.create_table(
                 DatabaseName=database_name,
                 TableInput=table_input,
             )
-            print(f"Created Glue table: {database_name}.{table_name}")
+            logger.info("Created Glue table: %s.%s", database_name, table_name)
 
     def _register_partition(
         self,
@@ -419,9 +423,9 @@ class GlueCatalogManager:
             partition_uri += f"/{column}={value}"
 
         if not self._s3_path_exists(partition_uri):
-            print(
+            logger.info(
                 "Skipping Glue partition registration because the S3 "
-                f"path is missing or empty: {partition_uri}"
+                "path is missing or empty: %s", partition_uri,
             )
             return
 
@@ -465,14 +469,14 @@ class GlueCatalogManager:
                 PartitionValueList=partition["Values"],
                 PartitionInput=partition,
             )
-            print(f"Updated Glue partition: {partition_uri}")
+            logger.info("Updated Glue partition: %s", partition_uri)
         except self.glue_client.exceptions.EntityNotFoundException:
             self.glue_client.create_partition(
                 DatabaseName=database_name,
                 TableName=table_name,
                 PartitionInput=partition,
             )
-            print(f"Created Glue partition: {partition_uri}")
+            logger.info("Created Glue partition: %s", partition_uri)
 
     def register_partitions(
         self,
@@ -522,10 +526,10 @@ def main() -> None:
     if target_layer not in valid_layers:
         raise ValueError("TARGET_LAYER must be bronze, silver, or gold")
 
-    print(f"Loading configuration from {config_uri}")
+    logger.info("Loading configuration from %s", config_uri)
     config = load_s3_config(config_uri)
     catalog_region = config.get("region")
-    print(f"Glue Catalog region: {catalog_region or 'job default'}")
+    logger.info("Glue Catalog region: %s", catalog_region or "job default")
 
     glue_context = GlueContext(SparkContext.getOrCreate())
     job = Job(glue_context)
@@ -533,13 +537,13 @@ def main() -> None:
 
     target_config = config[target_layer]
     source_uri = config[source_layer]["s3_uri"]
-    print(f"Source URI: {source_uri}")
+    logger.info("Source URI: %s", source_uri)
     df = read_parquet(
         glue_context, source_uri
     )
-    print(f"Total rows: {df.count()}")
+    logger.info("Total rows: %s", df.count())
     target_uri = target_config["s3_uri"]
-    print(f"Target URI: {target_uri}")
+    logger.info("Target URI: %s", target_uri)
     partition_by = ["year", "month"]
     # if partition_by:
     #     write_partitioned_parquets(
