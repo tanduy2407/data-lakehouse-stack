@@ -126,14 +126,6 @@ def _validate_partition_values(
             raise ValueError("month partition values must be between 1 and 12")
 
 
-def _normalize_partition_value(column: str, value: object) -> str:
-    """Return the canonical string form of a partition value."""
-    normalized_value = str(value)
-    if column == "month":
-        return normalized_value.zfill(2)
-    return normalized_value
-
-
 def _build_partitioned_folder_paths(
     base_path: str,
     partition_by: list[str],
@@ -289,6 +281,7 @@ class GlueCatalogManager:
 
     def __init__(self, region: str = None):
         self.glue_client = boto3.client("glue", region_name=region)
+        self.s3_client = boto3.client("s3", region_name=region)
 
     @staticmethod
     def _map_pyspark_type_to_glue(pyspark_type_str: str) -> str:
@@ -301,6 +294,14 @@ class GlueCatalogManager:
         }
         normalized = pyspark_type_str.lower()
         return type_mapping.get(normalized, pyspark_type_str)
+
+    @staticmethod
+    def _normalize_partition_value(column: str, value: object) -> str:
+        """Return the canonical string form of a partition value."""
+        normalized_value = str(value)
+        if column == "month":
+            return normalized_value.zfill(2)
+        return normalized_value
 
     def _validate_database(self, database_name: str) -> None:
         """Ensure that the Glue database exists."""
@@ -323,6 +324,16 @@ class GlueCatalogManager:
             raise ValueError(
                 f"Glue table does not exist: {database_name}.{table_name}"
             ) from error
+
+    def _s3_path_exists(self, s3_uri: str) -> bool:
+        """Return whether an S3 path contains at least one object."""
+        bucket, prefix = _parse_s3_uri(s3_uri)
+        response = self.s3_client.list_objects_v2(
+            Bucket=bucket,
+            Prefix=prefix.rstrip("/") + "/",
+            MaxKeys=1,
+        )
+        return bool(response.get("Contents"))
 
     def register_table(
         self,
@@ -381,11 +392,13 @@ class GlueCatalogManager:
                 DatabaseName=database_name,
                 TableInput=table_input,
             )
+            print(f"Updated Glue table: {database_name}.{table_name}")
         except self.glue_client.exceptions.EntityNotFoundException:
             self.glue_client.create_table(
                 DatabaseName=database_name,
                 TableInput=table_input,
             )
+            print(f"Created Glue table: {database_name}.{table_name}")
 
     def _register_partition(
         self,
@@ -397,13 +410,29 @@ class GlueCatalogManager:
         partition_values: dict[str, object],
     ) -> None:
         """Create or update one partition."""
+        partition_uri = target_uri.rstrip("/")
+        for column in partition_by:
+            value = GlueCatalogManager._normalize_partition_value(
+                column,
+                partition_values[column],
+            )
+            partition_uri += f"/{column}={value}"
+
+        if not self._s3_path_exists(partition_uri):
+            print(
+                "Skipping Glue partition registration because the S3 "
+                f"path is missing or empty: {partition_uri}"
+            )
+            return
+
         _validate_partition_values(partition_by, partition_values)
 
-        partition_uri = target_uri.rstrip("/")
         values = []
         for column in partition_by:
-            value = _normalize_partition_value(column, partition_values[column])
-            partition_uri += f"/{column}={value}"
+            value = GlueCatalogManager._normalize_partition_value(
+                column,
+                partition_values[column],
+            )
             values.append(value)
 
         columns = [
@@ -436,12 +465,14 @@ class GlueCatalogManager:
                 PartitionValueList=partition["Values"],
                 PartitionInput=partition,
             )
+            print(f"Updated Glue partition: {partition_uri}")
         except self.glue_client.exceptions.EntityNotFoundException:
             self.glue_client.create_partition(
                 DatabaseName=database_name,
                 TableName=table_name,
                 PartitionInput=partition,
             )
+            print(f"Created Glue partition: {partition_uri}")
 
     def register_partitions(
         self,
@@ -509,20 +540,18 @@ def main() -> None:
     print(f"Total rows: {df.count()}")
     target_uri = target_config["s3_uri"]
     print(f"Target URI: {target_uri}")
-    partition_by = target_config.get("partition_by")
-    if isinstance(partition_by, str):
-        partition_by = [partition_by]
-    if partition_by:
-        write_partitioned_parquets(
-            df, target_uri, target_config["write_mode"], partition_by
-        )
-    else:
-        write_parquet(df, target_uri, target_config["write_mode"])
+    partition_by = ["year", "month"]
+    # if partition_by:
+    #     write_partitioned_parquets(
+    #         df, target_uri, target_config["write_mode"], partition_by
+    #     )
+    # else:
+    #     write_parquet(df, target_uri, target_config["write_mode"])
 
-    catalog_database_name = target_config.get("database")
-    catalog_table = target_config.get("table")
+    catalog_database_name = "test_write_cpar"
+    catalog_table = "silver_test"
     if catalog_database_name and catalog_table:
-        catalog_partition_by = partition_by or []
+        catalog_partition_by = partition_by
         catalog_manager = GlueCatalogManager(catalog_region)
         catalog_manager.register_table(
             df,
