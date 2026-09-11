@@ -307,27 +307,30 @@ class GlueCatalogManager:
             return normalized_value.zfill(2)
         return normalized_value
 
-    def _validate_database(self, database_name: str) -> None:
-        """Ensure that the Glue database exists."""
+    def _database_exists(self, database_name: str) -> bool:
+        """Return whether the Glue database exists."""
         try:
             self.glue_client.get_database(Name=database_name)
-        except self.glue_client.exceptions.EntityNotFoundException as error:
-            raise ValueError(
-                f"Glue database does not exist: {database_name}"
-            ) from error
+            return True
+        except self.glue_client.exceptions.EntityNotFoundException:
+            logger.error("Glue database does not exist: %s", database_name)
+            return False
 
-    def _validate_table(self, database_name: str, table_name: str) -> None:
-        """Ensure that the Glue table exists in the specified database."""
-        self._validate_database(database_name)
+    def _table_exists(self, database_name: str, table_name: str) -> bool:
+        """Return whether the Glue table exists in the specified database."""
         try:
             self.glue_client.get_table(
                 DatabaseName=database_name,
                 Name=table_name,
             )
-        except self.glue_client.exceptions.EntityNotFoundException as error:
-            raise ValueError(
-                f"Glue table does not exist: {database_name}.{table_name}"
-            ) from error
+            return True
+        except self.glue_client.exceptions.EntityNotFoundException:
+            logger.error(
+                "Glue table does not exist: %s.%s",
+                database_name,
+                table_name,
+            )
+            return False
 
     def _s3_path_exists(self, s3_uri: str) -> bool:
         """Return whether an S3 path contains at least one object."""
@@ -348,7 +351,8 @@ class GlueCatalogManager:
         partition_by: list[str],
     ) -> None:
         """Create or update a Glue table definition."""
-        self._validate_database(database_name)
+        if not self._database_exists(database_name):
+            return
         fields = {field.name: field for field in dataframe.schema.fields}
         missing_partitions = set(partition_by) - fields.keys()
         if missing_partitions:
@@ -490,7 +494,10 @@ class GlueCatalogManager:
         if not partition_by:
             raise ValueError("partition_by is required to register partitions")
 
-        self._validate_table(database_name, table_name)
+        if not self._database_exists(database_name):
+            return
+        if not self._table_exists(database_name, table_name):
+            return
         partitions = [
             {column: row[column] for column in partition_by}
             for row in dataframe.select(*partition_by).distinct().collect()
