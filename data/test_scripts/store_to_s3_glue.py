@@ -418,6 +418,7 @@ class GlueCatalogManager:
         partition_values: dict[str, object],
     ) -> None:
         """Create or update one partition."""
+        # Build the canonical URI once; use it for both the S3 check and Glue metadata.
         partition_uri = target_uri.rstrip("/")
         for column in partition_by:
             value = GlueCatalogManager._normalize_partition_value(
@@ -426,6 +427,7 @@ class GlueCatalogManager:
             )
             partition_uri += f"/{column}={value}"
 
+        # Glue should only contain partitions backed by data already present in S3.
         if not self._s3_path_exists(partition_uri):
             logger.info(
                 "Skipping Glue partition registration because the S3 "
@@ -435,6 +437,7 @@ class GlueCatalogManager:
 
         _validate_partition_values(partition_by, partition_values)
 
+        # Glue expects partition values in the same order as PartitionKeys.
         values = []
         for column in partition_by:
             value = GlueCatalogManager._normalize_partition_value(
@@ -498,6 +501,8 @@ class GlueCatalogManager:
             return
         if not self._table_exists(database_name, table_name):
             return
+
+        # Distinct combinations avoid duplicate Glue calls when rows share a partition.
         partitions = [
             {column: row[column] for column in partition_by}
             for row in dataframe.select(*partition_by).distinct().collect()

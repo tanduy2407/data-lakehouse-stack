@@ -1,9 +1,17 @@
+region: ap-southeast-1
+
 bronze:
   s3_uri: s3://duncan-bucket-20250407/test_write_parquet/bronze_test/
   write_mode: append
 silver:
   s3_uri: s3://duncan-bucket-20250407/test_write_parquet/silver_test/
   write_mode: append
+  partition_by: [year, month]
+  database: test_write_cpar
+  table: silver_test
 gold:
   s3_uri: s3://duncan-bucket-20250407/test_write_parquet/gold_test/
-  write_mode: append
+  write_mode: overwrite
+  partition_by: [year, month]
+  database: test_write_cpar
+  table: gold_test

@@ -29,12 +29,16 @@ def build_fake_events(rows: int, seed: int) -> pd.DataFrame:
         )
 
     df = pd.DataFrame(data)
+    df["year"] = df["event_timestamp"].dt.year
+    df["month"] = df["event_timestamp"].dt.month
     return df.astype(
         {
             "event_id": "int64",
             "member_id": "int64",
             "event_type": "string",
             "amount": "float64",
+            "year": "int64",
+            "month": "int64",
         }
     )
 
