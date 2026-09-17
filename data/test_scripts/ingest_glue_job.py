@@ -12,20 +12,11 @@ from pyspark.sql.functions import col, month, year
 
 from mssql_connector import MSSQLConnector
 from schema_registry import SchemaRegistry
+from store_to_s3 import write_partitioned_parquets
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-
-def _required_environment(name: str) -> str:
-	"""Return a required non-empty environment variable."""
-	value = os.getenv(name)
-	if not value:
-		raise ValueError(f"Required environment variable is missing: {name}")
-	return value
-
 
 def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
 	"""Return the bucket and key from an S3 URI."""
@@ -37,32 +28,42 @@ def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
 		raise ValueError("S3 URI must include both a bucket and object key")
 	return bucket, key
 
+class Ingestion:
+	@staticmethod
+	def read_watermark_value() -> str:
+		"""Return a fixed watermark value for testing."""
+		return "2026-01-01T00:00:00"
 
-def _add_partition_columns(dataframe: DataFrame) -> DataFrame:
-	"""Derive year and month partition columns from event_timestamp."""
-	fields = {field.name: field for field in dataframe.schema.fields}
-	timestamp_field = fields.get("event_timestamp")
-	if timestamp_field is None:
-		raise ValueError("Source view must contain event_timestamp")
-	if timestamp_field.dataType.simpleString() not in {"timestamp", "timestamp_ntz"}:
-		raise ValueError("event_timestamp must be timestamp or timestamp_ntz")
+	def _add_partition_columns(self, dataframe: DataFrame, derived_from: str) -> DataFrame:
+		"""Derive year and month partition columns from the specified timestamp column."""
+		fields = {field.name: field for field in dataframe.schema.fields}
+		derived_from_field = fields.get(derived_from)
+		if derived_from_field is None:
+			raise ValueError(f"Source view must contain {derived_from}")
+		if derived_from_field.dataType.simpleString() not in {
+			"date",
+			"timestamp",
+			"timestamp_ntz",
+		}:
+			raise ValueError(
+				f"{derived_from} must be date, timestamp, or timestamp_ntz"
+			)
 
-	if dataframe.filter(col("event_timestamp").isNull()).limit(1).count():
-		raise ValueError("event_timestamp contains null values")
+		if dataframe.filter(col(derived_from).isNull()).limit(1).count():
+			raise ValueError(f"{derived_from} contains null values")
 
-	return (
-		dataframe.withColumn("year", year(col("event_timestamp")))
-		.withColumn("month", month(col("event_timestamp")))
-	)
+		return (
+			dataframe.withColumn("year", year(col(derived_from)))
+			.withColumn("month", month(col(derived_from)))
+		)
 
 
 def main() -> None:
-	"""Validate and ingest a JDBC view into partitioned Parquet on S3."""
+	"""Validate and ingest a JDBC query into partitioned Parquet on S3."""
 	args = getResolvedOptions(sys.argv, ["JOB_NAME"])
-	mssql_config_uri = _required_environment("MSSQL_CONFIG_URI")
-	target_s3_uri = _required_environment("TARGET_S3_URI")
-	schema_uri = _required_environment("EXPECTED_SCHEMA_URI")
-	write_mode = os.getenv("WRITE_MODE", "append").lower()
+	target_s3_uri = 's3://your-bucket/your-prefix'
+	schema_uri = 's3://your-bucket/your-schema-file'
+	write_mode = 'append'
 
 	_parse_s3_uri(target_s3_uri)
 
@@ -70,34 +71,41 @@ def main() -> None:
 	job = Job(glue_context)
 	job.init(args["JOB_NAME"], args)
 
+	ingestion = Ingestion()
+	watermark_value = ingestion.read_watermark_value()
+	logger.info("Loaded watermark value: %s", watermark_value)
+
 	schema_registry = SchemaRegistry(schema_uri)
-	mssql_connector, view_name = MSSQLConnector.from_yaml(mssql_config_uri)
-	source_df = mssql_connector.read_view(
-		glue_context.spark_session,
-		view_name,
+	host = 'host'
+	database_name = 'database'
+	user = 'user'
+	password = 'password'
+	query = 'SELECT * FROM dbo.events_view'
+	mssql_connector = MSSQLConnector(
+		host=host,
+		database_name=database_name,
+		user=user,
+		password=password,
 	)
-	source_schema = source_df.schema
-	logger.info("Source view schema:\n%s", source_schema.treeString())
+	source_df = mssql_connector.read_query(
+		glue_context.spark_session,
+		query,
+	)
 	if not schema_registry.is_match(source_df):
 		raise ValueError("Source schema does not match the configured definition")
 
-	partitioned_df = _add_partition_columns(source_df)
+	partitioned_df = ingestion._add_partition_columns(source_df, derived_from="event_timestamp")
 	row_count = partitioned_df.count()
 	if row_count == 0:
-		logger.info("Source view %s returned no rows; nothing to write", view_name)
+		logger.info("Source query returned no rows; nothing to write")
 		job.commit()
 		return
-
-	logger.info(
-		"Writing %s rows to %s partitioned by year and month",
-		row_count,
+	
+	write_partitioned_parquets(
+		partitioned_df,
 		target_s3_uri,
-	)
-	(
-		partitioned_df.write.mode(write_mode)
-		.format("parquet")
-		.partitionBy("year", "month")
-		.save(target_s3_uri)
+		write_mode=write_mode,
+		partition_by=["year", "month"],
 	)
 	logger.info("Ingestion completed successfully")
 	job.commit()
