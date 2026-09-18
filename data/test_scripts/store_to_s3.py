@@ -38,6 +38,18 @@ def load_s3_file(s3_uri: str) -> str:
 		) from error
 
 
+def load_s3_json(s3_uri: str) -> dict:
+	"""Load and parse JSON from S3."""
+	import json
+	contents = load_s3_file(s3_uri)
+	try:
+		return json.loads(contents)
+	except json.JSONDecodeError as error:
+		raise ValueError(
+			f"Invalid JSON in S3 file: {s3_uri}"
+		) from error
+
+
 def _validate_config(config: dict) -> dict:
     """Validate the layer configuration."""
     if not isinstance(config, dict):

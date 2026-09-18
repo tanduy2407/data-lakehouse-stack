@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-import json
 import logging
 
 from fastavro import parse_schema
-from store_to_s3 import load_s3_file
+from store_to_s3 import load_s3_json
 
 
 logger = logging.getLogger(__name__)
@@ -18,8 +17,7 @@ class SchemaRegistry:
 	@staticmethod
 	def load_avro_definition(schema_uri: str) -> list[dict]:
 		"""Load an Avro schema definition from S3."""
-		contents = load_s3_file(schema_uri)
-		definition = json.loads(contents)
+		definition = load_s3_json(schema_uri)
 		if not isinstance(definition, dict):
 			raise ValueError("Avro schema definition must be a JSON object")
 		try:
