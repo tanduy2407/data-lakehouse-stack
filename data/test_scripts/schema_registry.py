@@ -2,8 +2,8 @@
 import json
 import logging
 
-import boto3
 from fastavro import parse_schema
+from store_to_s3 import load_s3_file
 
 
 logger = logging.getLogger(__name__)
@@ -17,17 +17,8 @@ class SchemaRegistry:
 
 	@staticmethod
 	def load_avro_definition(schema_uri: str) -> list[dict]:
-		"""Load an Avro schema definition from local disk or S3."""
-		if schema_uri.startswith("s3://"):
-			bucket, separator, key = schema_uri.removeprefix("s3://").partition("/")
-			if not bucket or not separator or not key:
-				raise ValueError("Schema S3 URI must include bucket and key")
-			response = boto3.client("s3").get_object(Bucket=bucket, Key=key)
-			contents = response["Body"].read().decode("utf-8")
-		else:
-			with open(schema_uri, encoding="utf-8") as schema_file:
-				contents = schema_file.read()
-
+		"""Load an Avro schema definition from S3."""
+		contents = load_s3_file(schema_uri)
 		definition = json.loads(contents)
 		if not isinstance(definition, dict):
 			raise ValueError("Avro schema definition must be a JSON object")
@@ -36,6 +27,7 @@ class SchemaRegistry:
 		except Exception as error:
 			raise ValueError("Invalid Avro schema definition") from error
 
+		# Validate schema structure: must be a record type with non-empty fields list
 		if definition.get("type") != "record":
 			raise ValueError("Avro schema definition must be a record")
 
@@ -51,6 +43,7 @@ class SchemaRegistry:
 			name = field.get("name")
 			if not isinstance(name, str) or not name:
 				raise ValueError("Each schema field requires a non-empty name")
+			# Convert Avro type to Spark type for schema validation
 			data_type = SchemaRegistry._avro_to_spark_type(field.get("type"))
 
 			columns.append(
@@ -64,6 +57,7 @@ class SchemaRegistry:
 	@staticmethod
 	def _avro_to_spark_type(avro_type) -> str:
 		"""Convert an Avro type definition to Spark simpleString format."""
+		# Handle Avro union types (e.g., ["null", "string"]) by extracting the non-null type
 		if isinstance(avro_type, list):
 			non_null_types = [item for item in avro_type if item != "null"]
 			if len(non_null_types) != 1:
@@ -73,6 +67,7 @@ class SchemaRegistry:
 			return SchemaRegistry._avro_to_spark_type(non_null_types[0])
 
 		if isinstance(avro_type, dict):
+			# Handle Avro logical types (special types with additional metadata)
 			logical_type = avro_type.get("logicalType")
 			if logical_type in {"timestamp-millis", "timestamp-micros"}:
 				return "timestamp"
@@ -84,8 +79,10 @@ class SchemaRegistry:
 				if not isinstance(precision, int) or not isinstance(scale, int):
 					raise ValueError("Avro decimal requires integer precision and scale")
 				return f"decimal({precision},{scale})"
+			# Extract the underlying type for logical types
 			avro_type = avro_type.get("type")
 
+		# Map basic Avro types to Spark SQL types
 		type_mapping = {
 			"boolean": "boolean",
 			"int": "int",
@@ -111,20 +108,21 @@ class SchemaRegistry:
 			for field in dataframe.schema.fields
 		}
 
-		# Set differences identify columns present on only one side.
+		# Check for columns present in expected but missing in actual
 		missing_columns = set(expected_schema) - set(actual_schema)
 		if missing_columns:
 			differences.append(
 				"missing columns: " + ", ".join(sorted(missing_columns))
 			)
 
+		# Check for columns present in actual but not in expected
 		extra_columns = set(actual_schema) - set(expected_schema)
 		if extra_columns:
 			differences.append(
 				"extra columns: " + ", ".join(sorted(extra_columns))
 			)
 
-		# Compare types only for columns that exist in both schemas.
+		# Compare data types for columns present in both schemas
 		for column_name in set(expected_schema) & set(actual_schema):
 			if actual_schema[column_name] != expected_schema[column_name]:
 				differences.append(

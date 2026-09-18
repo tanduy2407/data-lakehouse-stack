@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def _parse_s3_uri(s3_uri: str) -> tuple:
+def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
     """Return the bucket and key from an S3 URI."""
     if not isinstance(s3_uri, str) or not s3_uri.startswith("s3://"):
         raise ValueError("S3 URI must start with s3://")
@@ -24,6 +24,18 @@ def _parse_s3_uri(s3_uri: str) -> tuple:
     if not bucket or not separator or not key:
         raise ValueError("S3 URI must include both a bucket and object key")
     return bucket, key
+
+
+def load_s3_file(s3_uri: str) -> str:
+	"""Load raw file contents from S3."""
+	bucket, key = _parse_s3_uri(s3_uri)
+	try:
+		response = boto3.client("s3").get_object(Bucket=bucket, Key=key)
+		return response["Body"].read().decode("utf-8")
+	except Exception as error:
+		raise RuntimeError(
+			f"Failed to load file from S3: {s3_uri}"
+		) from error
 
 
 def _validate_config(config: dict) -> dict:

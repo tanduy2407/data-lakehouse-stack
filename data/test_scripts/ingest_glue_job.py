@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import logging
-import os
 import sys
 
 from awsglue.context import GlueContext
@@ -12,21 +11,11 @@ from pyspark.sql.functions import col, month, year
 
 from mssql_connector import MSSQLConnector
 from schema_registry import SchemaRegistry
-from store_to_s3 import write_partitioned_parquets
+from store_to_s3 import write_partitioned_parquets, _parse_s3_uri
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
-	"""Return the bucket and key from an S3 URI."""
-	if not s3_uri.startswith("s3://"):
-		raise ValueError("S3 URI must start with s3://")
-
-	bucket, separator, key = s3_uri.removeprefix("s3://").partition("/")
-	if not bucket or not separator or not key:
-		raise ValueError("S3 URI must include both a bucket and object key")
-	return bucket, key
 
 class Ingestion:
 	@staticmethod
