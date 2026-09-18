@@ -153,6 +153,11 @@ def _validate_partition_values(
         if not month.isdigit() or not 1 <= int(month) <= 12:
             raise ValueError("month partition values must be between 1 and 12")
 
+    if "day" in partition_by:
+        day = str(partition_values["day"])
+        if not day.isdigit() or not 1 <= int(day) <= 31:
+            raise ValueError("day partition values must be between 1 and 31")
+
 
 def _build_partitioned_folder_paths(
     base_path: str,
@@ -251,6 +256,20 @@ def _prepare_partition_columns(dataframe: DataFrame, partition_by: list[str]) ->
         dataframe = dataframe.withColumn(
             "month",
             lpad(col("month").cast("string"), 2, "0"),
+        )
+
+    if "day" in partition_by:
+        invalid_days = dataframe.filter(
+            col("day").isNull()
+            | ~col("day").cast("string").rlike(r"^(0?[1-9]|[12][0-9]|3[01])$")
+        ).limit(1).count()
+
+        if invalid_days:
+            raise ValueError("day partition values must be between 1 and 31")
+
+        dataframe = dataframe.withColumn(
+            "day",
+            lpad(col("day").cast("string"), 2, "0"),
         )
     return dataframe
 
