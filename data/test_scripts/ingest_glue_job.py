@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from datetime import date, datetime
 import logging
 import sys
 
@@ -25,16 +26,26 @@ class Ingestion:
 		return "2026-01-01T00:00:00"
 
 	@staticmethod
-	def calculate_new_watermark(dataframe: DataFrame, timestamp_column: str):
-		"""Return the greatest timestamp value from the ingested data."""
-		if not isinstance(timestamp_column, str) or not timestamp_column.strip():
-			raise ValueError("Timestamp column must be a non-empty string")
-		if timestamp_column not in dataframe.columns:
-			raise ValueError(f"DataFrame must contain {timestamp_column}")
+	def calculate_new_watermark(
+		dataframe: DataFrame,
+		watermark_column: str,
+	) -> str | None:
+		"""Return the greatest watermark value as a string."""
+		if not isinstance(watermark_column, str) or not watermark_column.strip():
+			raise ValueError("Watermark column must be a non-empty string")
+		if watermark_column not in dataframe.columns:
+			raise ValueError(f"DataFrame must contain {watermark_column}")
+		if dataframe.limit(1).count() == 0:
+			logger.info("DataFrame is empty; no new watermark was generated")
+			return None
 		new_watermark = dataframe.agg(
-			spark_max(col(timestamp_column)).alias("new_watermark")
+			spark_max(col(watermark_column)).alias("new_watermark")
 		).first()["new_watermark"]
-		return new_watermark
+		if new_watermark is None:
+			return None
+		if isinstance(new_watermark, (date, datetime)):
+			return new_watermark.isoformat()
+		return str(new_watermark)
 
 	@staticmethod
 	def process_fail_fast(
