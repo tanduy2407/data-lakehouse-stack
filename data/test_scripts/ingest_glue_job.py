@@ -18,6 +18,11 @@ from store_to_s3 import write_parquet, write_partitioned_parquets
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+class FailFastIngestionError(RuntimeError):
+	"""Signal a non-retryable ingestion failure."""
+
+
 class Ingestion:
 	@staticmethod
 	def read_watermark() -> str | None:
@@ -60,7 +65,9 @@ class Ingestion:
 		if not schema_registry.is_match(dataframe):
 			logger.error("Schema mismatch; writing rejected data to %s", error_s3_uri)
 			write_parquet(dataframe, error_s3_uri, mode="append")
-			raise ValueError("Source schema does not match the configured definition")
+			raise FailFastIngestionError(
+				"Source schema does not match the configured definition"
+			)
 		logger.info("Source schema validated")
 
 	@staticmethod

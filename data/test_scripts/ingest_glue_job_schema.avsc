@@ -1,0 +1,17 @@
+{
+  "type": "record",
+  "name": "Event",
+  "namespace": "data_lakehouse.ingest",
+  "version": 2,
+  "insert_timestamp": "2026-09-22T15:28:20Z",
+  "fields": [
+    {"name": "event_id", "type": "long"},
+    {"name": "member_id", "type": "long"},
+    {"name": "event_type", "type": "string"},
+    {"name": "amount", "type": "double"},
+    {
+      "name": "event_timestamp",
+      "type": {"type": "long", "logicalType": "timestamp-micros"}
+    }
+  ]
+}
