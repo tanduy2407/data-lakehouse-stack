@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
-    """Return the bucket and key from an S3 URI."""
+    """Parse an S3 object/file URI and return its bucket and object key."""
     if not isinstance(s3_uri, str) or not s3_uri.startswith("s3://"):
         raise ValueError("S3 URI must start with s3://")
 
@@ -24,6 +24,12 @@ def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
     if not bucket or not separator or not key:
         raise ValueError("S3 URI must include both a bucket and object key")
     return bucket, key
+
+
+def _parse_s3_prefix(s3_uri: str) -> tuple[str, str]:
+    """Parse an S3 prefix URI and return its bucket and normalized key prefix."""
+    bucket, prefix = _parse_s3_uri(s3_uri)
+    return bucket, prefix.rstrip("/") + "/"
 
 
 def load_s3_file(s3_uri: str) -> str:

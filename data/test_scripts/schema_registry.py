@@ -1,22 +1,71 @@
 #!/usr/bin/env python3
+import json
 import logging
+import re
+from datetime import datetime, timezone
 
+import boto3
+from pyspark.sql import DataFrame
 from fastavro import parse_schema
-from store_to_s3 import load_s3_json
+from store_to_s3 import _parse_s3_prefix, load_s3_json
 
 logger = logging.getLogger(__name__)
 
 
 class SchemaRegistry:
-	"""Load an ordered schema contract and compare it with a DataFrame schema."""
+	"""Manage Avro schema definitions stored in S3."""
+	def __init__(self, project: str, dataset: str):
+		bucket = "schema-registry"
+		self.project = project
+		self.dataset = dataset
+		self.schema_prefix = f"s3://{bucket}/{self.project}/{self.dataset}"
+		self.columns = self.load_avro_definition()
 
-	def __init__(self, schema_uri: str):
-		self._columns = self.load_avro_definition(schema_uri)
+	def _read_schema_files(self) -> list[str]:
+		"""Read all object paths under an S3 table schema prefix."""
+		bucket, prefix = _parse_s3_prefix(self.schema_prefix)
+		files = []
+		paginator = boto3.client("s3").get_paginator("list_objects_v2")
+		pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
+		for page in pages:
+			for object_info in page.get("Contents", []):
+				key = object_info.get("Key", "")
+				if key:
+					files.append(f"s3://{bucket}/{key}")
+		logger.info("Found %d objects under schema prefix: %s", len(files), self.schema_prefix)
+		return files
 
-	@staticmethod
-	def load_avro_definition(schema_uri: str) -> list[dict]:
+	def _get_latest_avro_file(self) -> tuple[str, int]:
+		"""Return the latest schema URI and its numeric filename version."""
+		versioned_schemas = []
+		schema_files = self._read_schema_files()
+		for schema_file in schema_files:
+			match = re.search(r"(?:^|/)v(\d+)\.avsc$", schema_file)
+			if match:
+				versioned_schemas.append((int(match.group(1)), schema_file))
+
+		if not versioned_schemas:
+			raise ValueError("No versioned Avro schemas found under the S3 schema path")
+
+		latest_version, latest_schema_uri = max(
+			versioned_schemas, key=lambda item: item[0]
+		)
+		logger.info(
+			"Selected latest schema: %s (version=%d)",
+			latest_schema_uri,
+			latest_version,
+		)
+		return latest_schema_uri, latest_version
+	
+	def load_avro_definition(self) -> list[dict]:
 		"""Load an Avro schema definition from S3."""
-		definition = load_s3_json(schema_uri)
+		self.schema_uri, self.schema_version = self._get_latest_avro_file()
+		logger.info(
+			"Loading schema definition: %s (version=%d)",
+			self.schema_uri,
+			self.schema_version,
+		)
+		definition = load_s3_json(self.schema_uri)
 		if not isinstance(definition, dict):
 			raise ValueError("Avro schema definition must be a JSON object")
 		try:
@@ -98,7 +147,7 @@ class SchemaRegistry:
 		differences = []
 		# Dictionaries make schema comparison independent of column order.
 		expected_schema = {
-			column["name"]: column["type"] for column in self._columns
+			column["name"]: column["type"] for column in self.columns
 		}
 		actual_schema = {
 			field.name: field.dataType.simpleString().lower()
@@ -137,7 +186,52 @@ class SchemaRegistry:
 		logger.info("Source view schema matches the configured definition")
 		return True
 
-	def register_schema(self):
-		"""Register the current schema contract."""
-		# Implementation for registering the schema goes here
-		pass
+	def _spark_dataframe_to_avro_schema(
+		self,
+		dataframe: DataFrame
+	) -> dict:
+		"""Convert a Spark DataFrame schema to an Avro record definition."""
+		converter = dataframe.sparkSession._jvm.org.apache.spark.sql.avro.SchemaConverters
+		avro_schema = converter.toAvroType(
+			dataframe._jdf.schema(),
+			False,
+			self.dataset,
+			self.project.lower(),
+		)
+		definition = json.loads(avro_schema.toString())
+		definition["version"] = self.schema_version + 1
+		definition["insert_timestamp"] = datetime.now(timezone.utc).strftime(
+			"%Y-%m-%d %H:%M:%S"
+		)
+		logger.info(
+			"Generated schema definition for %s version=%d at %s",
+			self.dataset,
+			definition["version"],
+			definition["insert_timestamp"],
+		)
+		return definition
+
+	def register_schema(
+		self,
+		dataframe: DataFrame,
+	) -> dict:
+		"""Build and upload the next Avro schema version to S3."""
+		try:
+			avro_schema = self._spark_dataframe_to_avro_schema(
+				dataframe
+			)
+			version = avro_schema["version"]
+			bucket, prefix = _parse_s3_prefix(self.schema_prefix)
+			key = f"{prefix}v{version}.avsc"
+			schema_uri = f"s3://{bucket}/{key}"
+			boto3.client("s3").put_object(
+				Bucket=bucket,
+				Key=key,
+				Body=json.dumps(avro_schema, indent=2).encode("utf-8"),
+				ContentType="application/json",
+			)
+			logger.info("Uploaded schema version %d to %s", version, schema_uri)
+			return avro_schema
+		except Exception as e:
+			logger.error("Failed to register schema: %s", str(e))
+			raise

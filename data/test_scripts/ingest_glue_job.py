@@ -134,8 +134,9 @@ def main() -> None:
 	args = getResolvedOptions(sys.argv, ["JOB_NAME"])
 	target_s3_uri = 's3://your-bucket/your-prefix'
 	error_s3_uri = 's3://your-bucket/error-prefix'
-	schema_uri = 's3://your-bucket/your-schema-file'
 	write_mode = 'append'
+	project_name = 'your-bucket'
+	table_name = 'events_view'
 
 	glue_context = GlueContext(SparkContext.getOrCreate())
 	job = Job(glue_context)
@@ -145,13 +146,12 @@ def main() -> None:
 	watermark_value = ingestion.read_watermark()
 	logger.info("Loaded watermark value: %s", watermark_value)
 
-	schema_registry = SchemaRegistry(schema_uri)
+	schema_registry = SchemaRegistry(project_name, table_name)
 	host = 'host'
 	database_name = 'database'
 	user = 'user'
 	password = 'password'
 	schema_name = 'dbo'
-	table_name = 'events_view'
 	timestamp_column = 'event_timestamp'
 	
 	mssql_connector = MSSQLConnector(
