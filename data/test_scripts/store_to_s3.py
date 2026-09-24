@@ -32,6 +32,24 @@ def _parse_s3_prefix(s3_uri: str) -> tuple[str, str]:
     return bucket, prefix.rstrip("/") + "/"
 
 
+def read_s3_files(s3_prefix: str, extension: str | None = None) -> list[str]:
+    """Read object URIs under an S3 prefix, optionally filtered by extension."""
+    if extension is not None and (not isinstance(extension, str) or not extension):
+        raise ValueError("extension must be a non-empty string")
+
+    bucket, prefix = _parse_s3_prefix(s3_prefix)
+    files = []
+    paginator = boto3.client("s3").get_paginator("list_objects_v2")
+    pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
+    for page in pages:
+        for object_info in page.get("Contents", []):
+            key = object_info.get("Key", "")
+            if key and (extension is None or key.endswith(extension)):
+                files.append(f"s3://{bucket}/{key}")
+    logger.info("Found %d objects under S3 prefix: %s", len(files), s3_prefix)
+    return files
+
+
 def load_s3_file(s3_uri: str) -> str:
 	"""Load raw file contents from S3."""
 	bucket, key = _parse_s3_uri(s3_uri)

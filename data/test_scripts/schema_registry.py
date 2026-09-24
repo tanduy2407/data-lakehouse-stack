@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import boto3
 from pyspark.sql import DataFrame
 from fastavro import parse_schema
-from store_to_s3 import _parse_s3_prefix, load_s3_json
+from store_to_s3 import _parse_s3_prefix, load_s3_json, read_s3_files
 
 logger = logging.getLogger(__name__)
 
@@ -21,24 +21,10 @@ class SchemaRegistry:
 		self.schema_prefix = f"s3://{bucket}/{self.project}/{self.dataset}"
 		self.columns = self.load_avro_definition()
 
-	def _read_schema_files(self) -> list[str]:
-		"""Read all object paths under an S3 table schema prefix."""
-		bucket, prefix = _parse_s3_prefix(self.schema_prefix)
-		files = []
-		paginator = boto3.client("s3").get_paginator("list_objects_v2")
-		pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
-		for page in pages:
-			for object_info in page.get("Contents", []):
-				key = object_info.get("Key", "")
-				if key:
-					files.append(f"s3://{bucket}/{key}")
-		logger.info("Found %d objects under schema prefix: %s", len(files), self.schema_prefix)
-		return files
-
 	def _get_latest_avro_file(self) -> tuple[str, int]:
 		"""Return the latest schema URI and its numeric filename version."""
 		versioned_schemas = []
-		schema_files = self._read_schema_files()
+		schema_files = read_s3_files(self.schema_prefix, extension=".avsc")
 		for schema_file in schema_files:
 			match = re.search(r"(?:^|/)v(\d+)\.avsc$", schema_file)
 			if match:
