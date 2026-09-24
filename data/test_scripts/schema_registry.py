@@ -4,10 +4,9 @@ import logging
 import re
 from datetime import datetime, timezone
 
-import boto3
 from pyspark.sql import DataFrame
 from fastavro import parse_schema
-from store_to_s3 import _parse_s3_prefix, load_s3_json, read_s3_files
+from store_to_s3 import load_s3_json, read_s3_files, upload_s3_json
 
 logger = logging.getLogger(__name__)
 
@@ -200,24 +199,19 @@ class SchemaRegistry:
 	def register_schema(
 		self,
 		dataframe: DataFrame,
-	) -> dict:
+	) -> None:
 		"""Build and upload the next Avro schema version to S3."""
 		try:
 			avro_schema = self._spark_dataframe_to_avro_schema(
 				dataframe
 			)
 			version = avro_schema["version"]
-			bucket, prefix = _parse_s3_prefix(self.schema_prefix)
-			key = f"{prefix}v{version}.avsc"
-			schema_uri = f"s3://{bucket}/{key}"
-			boto3.client("s3").put_object(
-				Bucket=bucket,
-				Key=key,
-				Body=json.dumps(avro_schema, indent=2).encode("utf-8"),
-				ContentType="application/json",
+			schema_uri = upload_s3_json(
+				self.schema_prefix,
+				f"v{version}.avsc",
+				avro_schema,
 			)
-			logger.info("Uploaded schema version %d to %s", version, schema_uri)
-			return avro_schema
+			logger.info("Registered schema version %d at %s", version, schema_uri)
 		except Exception as e:
 			logger.error("Failed to register schema: %s", str(e))
 			raise

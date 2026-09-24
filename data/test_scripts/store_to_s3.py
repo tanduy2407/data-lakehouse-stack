@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import logging
+import json
 import sys
 
 import boto3
@@ -48,6 +49,26 @@ def read_s3_files(s3_prefix: str, extension: str | None = None) -> list[str]:
                 files.append(f"s3://{bucket}/{key}")
     logger.info("Found %d objects under S3 prefix: %s", len(files), s3_prefix)
     return files
+
+
+def upload_s3_json(s3_prefix: str, filename: str, payload: dict) -> str:
+    """Upload a JSON object under an S3 prefix and return its URI."""
+    if not isinstance(filename, str) or not filename or "/" in filename:
+        raise ValueError("filename must be a non-empty file name")
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a dictionary")
+
+    bucket, prefix = _parse_s3_prefix(s3_prefix)
+    key = f"{prefix}{filename}"
+    boto3.client("s3").put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(payload, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+    schema_uri = f"s3://{bucket}/{key}"
+    logger.info("Uploaded JSON object to %s", schema_uri)
+    return schema_uri
 
 
 def load_s3_file(s3_uri: str) -> str:
