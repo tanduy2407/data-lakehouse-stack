@@ -75,7 +75,9 @@ class SchemaRegistry:
 			if not isinstance(name, str) or not name:
 				raise ValueError("Each schema field requires a non-empty name")
 			# Convert Avro type to Spark type for schema validation
-			data_type = SchemaRegistry._avro_to_spark_type(field.get("type"))
+			success, data_type, error = SchemaRegistry._avro_to_spark_type(field.get("type"))
+			if not success:
+				raise ValueError(error)
 
 			columns.append(
 				{
@@ -86,32 +88,65 @@ class SchemaRegistry:
 		return columns
 
 	@staticmethod
-	def _avro_to_spark_type(avro_type) -> str:
+	def _avro_to_spark_type(avro_type) -> tuple[bool, str | None, str | None]:
 		"""Convert an Avro type definition to Spark simpleString format."""
-		# Handle Avro union types (e.g., ["null", "string"]) by extracting the non-null type
 		if isinstance(avro_type, list):
-			non_null_types = [item for item in avro_type if item != "null"]
+			non_null_types = [item for item in avro_type if item not in {"null", None}]
 			if len(non_null_types) != 1:
-				raise ValueError(
-					"Avro unions must contain exactly one non-null data type"
-				)
+				return False, None,  "Avro unions must contain exactly one non-null data type"
 			return SchemaRegistry._avro_to_spark_type(non_null_types[0])
 
 		if isinstance(avro_type, dict):
-			# Handle Avro logical types (special types with additional metadata)
 			logical_type = avro_type.get("logicalType")
 			if logical_type in {"timestamp-millis", "timestamp-micros"}:
-				return "timestamp"
+				return True, "timestamp", None
 			if logical_type == "date":
-				return "date"
+				return True, "date", None
 			if logical_type == "decimal":
 				precision = avro_type.get("precision")
 				scale = avro_type.get("scale", 0)
 				if not isinstance(precision, int) or not isinstance(scale, int):
-					raise ValueError("Avro decimal requires integer precision and scale")
-				return f"decimal({precision},{scale})"
-			# Extract the underlying type for logical types
-			avro_type = avro_type.get("type")
+					return False, None, "Avro decimal requires integer precision and scale"
+				return True, f"decimal({precision},{scale})", None
+
+			avro_kind = avro_type.get("type")
+			if avro_kind == "array":
+				success, item_type, error = SchemaRegistry._avro_to_spark_type(
+					avro_type.get("items")
+				)
+				if not success:
+					return False, None, error
+				return True, f"array<{item_type}>", None
+
+			if avro_kind == "map":
+				success, value_type, error = SchemaRegistry._avro_to_spark_type(
+					avro_type.get("values")
+				)
+				if not success:
+					return False, None, error
+				return True, f"map<string,{value_type}>", None
+
+			if avro_kind == "record":
+				fields = avro_type.get("fields")
+				if not isinstance(fields, list):
+					return False, None, "Avro record must contain a fields list"
+				field_types = []
+				for field in fields:
+					if not isinstance(field, dict) or not field.get("name"):
+						return False, None, "Each nested Avro field requires a name"
+					success, field_type, error = SchemaRegistry._avro_to_spark_type(
+						field.get("type")
+					)
+					if not success:
+						return False, None, error
+					field_types.append(f"{field['name']}:{field_type}")
+				return True, "struct<" + ",".join(field_types) + ">", None
+
+			if avro_kind == "enum":
+				return True, "string", None
+			if avro_kind == "fixed":
+				return True, "binary", None
+			avro_type = avro_kind
 
 		# Map basic Avro types to Spark SQL types
 		type_mapping = {
@@ -124,8 +159,8 @@ class SchemaRegistry:
 			"string": "string",
 		}
 		if avro_type not in type_mapping:
-			raise ValueError(f"Unsupported Avro field type: {avro_type}")
-		return type_mapping[avro_type]
+			return False, None,  f"Unsupported Avro field type: {avro_type}"
+		return True, type_mapping[avro_type], None
 
 	def _find_differences(self, dataframe) -> list[str]:
 		"""Return differences between a DataFrame and the schema contract."""
