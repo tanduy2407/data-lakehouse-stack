@@ -12,7 +12,7 @@ from pyspark.sql.functions import col, dayofmonth, month, year, max as spark_max
 
 from mssql_connector import MSSQLConnector
 from schema_registry import SchemaRegistry
-from store_to_s3 import write_parquet, write_partitioned_parquets
+from store_to_s3 import S3Client
 
 
 logging.basicConfig(level=logging.INFO)
@@ -64,7 +64,7 @@ class Ingestion:
 
 		if not schema_registry.is_match(dataframe):
 			logger.error("Schema mismatch; writing rejected data to %s", error_s3_uri)
-			write_parquet(dataframe, error_s3_uri, mode="append")
+			S3Client().write_parquet(dataframe, error_s3_uri, mode="append")
 			raise FailFastIngestionError(
 				"Source schema does not match the configured definition"
 			)
@@ -197,7 +197,7 @@ def main() -> None:
 		return
 	
 	# Write to S3
-	write_partitioned_parquets(
+	S3Client().write_partitioned_parquets(
 		partitioned_df,
 		target_s3_uri,
 		mode=write_mode,

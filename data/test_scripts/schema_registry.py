@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from pyspark.sql import DataFrame
 from fastavro import parse_schema
-from store_to_s3 import load_s3_json, read_s3_files, upload_s3_json
+from store_to_s3 import S3Client
 
 logger = logging.getLogger(__name__)
 
@@ -17,13 +17,17 @@ class SchemaRegistry:
 		bucket = "schema-registry"
 		self.project = project
 		self.dataset = dataset
+		self.s3_client = S3Client()
 		self.schema_prefix = f"s3://{bucket}/{self.project}/{self.dataset}"
 		self.columns = self.load_avro_definition()
 
 	def _get_latest_avro_file(self) -> tuple[str, int]:
 		"""Return the latest schema URI and its numeric filename version."""
 		versioned_schemas = []
-		schema_files = read_s3_files(self.schema_prefix, extension=".avsc")
+		schema_files = self.s3_client.read_files(
+			self.schema_prefix,
+			extension=".avsc",
+		)
 		for schema_file in schema_files:
 			match = re.search(r"(?:^|/)v(\d+)\.avsc$", schema_file)
 			if match:
@@ -50,7 +54,7 @@ class SchemaRegistry:
 			self.schema_uri,
 			self.schema_version,
 		)
-		definition = load_s3_json(self.schema_uri)
+		definition = self.s3_client.load_json(self.schema_uri)
 		if not isinstance(definition, dict):
 			raise ValueError("Avro schema definition must be a JSON object")
 		try:
@@ -241,7 +245,7 @@ class SchemaRegistry:
 				dataframe
 			)
 			version = avro_schema["version"]
-			schema_uri = upload_s3_json(
+			schema_uri = self.s3_client.upload_json(
 				self.schema_prefix,
 				f"v{version}.avsc",
 				avro_schema,
