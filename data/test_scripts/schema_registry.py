@@ -13,8 +13,7 @@ logger = logging.getLogger(__name__)
 
 class SchemaRegistry:
 	"""Manage Avro schema definitions stored in S3."""
-	def __init__(self, project: str, dataset: str):
-		bucket = "schema-registry"
+	def __init__(self, project: str, dataset: str, bucket = "schema-registry"):
 		self.project = project
 		self.dataset = dataset
 		self.s3_client = S3Client()
@@ -55,6 +54,8 @@ class SchemaRegistry:
 			self.schema_version,
 		)
 		definition = self.s3_client.load_json(self.schema_uri)
+		self.definition = definition
+
 		if not isinstance(definition, dict):
 			raise ValueError("Avro schema definition must be a JSON object")
 		try:
@@ -69,7 +70,7 @@ class SchemaRegistry:
 		fields = definition.get("fields")
 		if not isinstance(fields, list) or not fields:
 			raise ValueError("Avro schema must contain a non-empty fields list")
-
+	
 		columns = []
 		for field in fields:
 			if not isinstance(field, dict):
@@ -90,7 +91,40 @@ class SchemaRegistry:
 				}
 			)
 		return columns
+	
+	def _has_schema_changes(self, dataframe) -> bool:
+		"""Return whether a DataFrame schema differs from the contract."""
+		# Dictionaries make schema comparison independent of column order.
+		expected_schema = {
+			column["name"]: column["type"] for column in self.columns
+		}
+		actual_schema = {
+			field.name: field.dataType.simpleString().lower()
+			for field in dataframe.schema.fields
+		}
 
+		# Check for columns present in expected but missing in actual
+		missing_columns = set(expected_schema) - set(actual_schema)
+
+		# Check for columns present in actual but not in expected
+		extra_columns = set(actual_schema) - set(expected_schema)
+
+		# Compare data types for columns present in both schemas
+		change_columns = []
+		for column_name in set(expected_schema) & set(actual_schema):
+			if actual_schema[column_name] != expected_schema[column_name]:
+				change_columns.append(column_name)
+		if any((missing_columns, extra_columns, change_columns)):
+			return True
+		return False
+
+	def validate_schema(self, dataframe):
+		"""Return whether the DataFrame schema matches the contract."""
+		has_changes = self._has_schema_changes(dataframe)
+		if has_changes:
+			logger.error("Source schema mismatch")
+		logger.info("Source view schema matches the configured definition")
+	
 	@staticmethod
 	def _avro_to_spark_type(avro_type) -> tuple[bool, str | None, str | None]:
 		"""Convert an Avro type definition to Spark simpleString format."""
@@ -166,50 +200,45 @@ class SchemaRegistry:
 			return False, None,  f"Unsupported Avro field type: {avro_type}"
 		return True, type_mapping[avro_type], None
 
-	def _find_differences(self, dataframe) -> list[str]:
-		"""Return differences between a DataFrame and the schema contract."""
-		differences = []
-		# Dictionaries make schema comparison independent of column order.
-		expected_schema = {
-			column["name"]: column["type"] for column in self.columns
-		}
-		actual_schema = {
-			field.name: field.dataType.simpleString().lower()
-			for field in dataframe.schema.fields
-		}
-
-		# Check for columns present in expected but missing in actual
-		missing_columns = set(expected_schema) - set(actual_schema)
-		if missing_columns:
-			differences.append(
-				"missing columns: " + ", ".join(sorted(missing_columns))
-			)
-
-		# Check for columns present in actual but not in expected
-		extra_columns = set(actual_schema) - set(expected_schema)
-		if extra_columns:
-			differences.append(
-				"extra columns: " + ", ".join(sorted(extra_columns))
-			)
-
-		# Compare data types for columns present in both schemas
-		for column_name in set(expected_schema) & set(actual_schema):
-			if actual_schema[column_name] != expected_schema[column_name]:
-				differences.append(
-					f"{column_name} type: expected={expected_schema[column_name]}, "
-					f"actual={actual_schema[column_name]}"
+	def _get_schema_changes(self, new_fields: list[dict]) -> dict:
+		"""Describe field additions, removals, and type changes."""
+		def field_types(fields: list[dict]) -> dict[str, str]:
+			result = {}
+			for field in fields:
+				name = field.get("name")
+				if not isinstance(name, str) or not name:
+					raise ValueError("Each schema field requires a non-empty name")
+				success, data_type, error = self._avro_to_spark_type(
+					field.get("type")
 				)
-		return differences
+				if not success:
+					raise ValueError(error)
+				result[name] = data_type
+			return result
 
-	def is_match(self, dataframe) -> bool:
-		"""Return whether the DataFrame schema matches the contract."""
-		differences = self._find_differences(dataframe)
-		if differences:
-			logger.error("Source schema mismatch: %s", "; ".join(differences))
-			return False
-		logger.info("Source view schema matches the configured definition")
-		return True
-
+		old_field_types = field_types(self.definition["fields"])
+		new_field_types = field_types(new_fields)
+		added = [
+			{"name": name, "type": new_field_types[name]}
+			for name in sorted(set(new_field_types) - set(old_field_types))
+		]
+		removed = [
+			{"name": name, "type": old_field_types[name]}
+			for name in sorted(set(old_field_types) - set(new_field_types))
+		]
+		modified = [
+			{
+				"name": name,
+				"from": old_field_types[name],
+				"to": new_field_types[name],
+			}
+			for name in sorted(set(old_field_types) & set(new_field_types))
+			if old_field_types[name] != new_field_types[name]
+		]
+		return {"added": added, 
+		        "removed": removed, 
+				"modified": modified}
+	
 	def _spark_dataframe_to_avro_schema(
 		self,
 		dataframe: DataFrame
@@ -227,6 +256,7 @@ class SchemaRegistry:
 		definition["insert_timestamp"] = datetime.now(timezone.utc).strftime(
 			"%Y-%m-%d %H:%M:%S"
 		)
+		definition["changes"] = self._get_schema_changes(definition["fields"])
 		logger.info(
 			"Generated schema definition for %s version=%d at %s",
 			self.dataset,
@@ -238,12 +268,16 @@ class SchemaRegistry:
 	def register_schema(
 		self,
 		dataframe: DataFrame,
-	) -> None:
-		"""Build and upload the next Avro schema version to S3."""
+	):
+		"""Build and upload the next Avro schema version when fields changed."""
 		try:
 			avro_schema = self._spark_dataframe_to_avro_schema(
 				dataframe
 			)
+			changes = avro_schema["changes"]
+			if not any(changes.values()):
+				logger.info("Schema unchanged; skipping registration")
+				return
 			version = avro_schema["version"]
 			schema_uri = self.s3_client.upload_json(
 				self.schema_prefix,
