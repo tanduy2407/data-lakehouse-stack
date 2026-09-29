@@ -28,7 +28,9 @@ class Ingestion:
 	def read_watermark() -> str | None:
 		"""Return the configured watermark for incremental loads, 
 		or None for a full load."""
-		return "2026-01-01T00:00:00"
+		watermark = "2026-01-01T00:00:00"
+		logger.info("Loaded watermark value: %s", watermark)
+		return watermark
 
 	@staticmethod
 	def calculate_new_watermark(
@@ -49,8 +51,11 @@ class Ingestion:
 		if new_watermark is None:
 			return None
 		if isinstance(new_watermark, (date, datetime)):
-			return new_watermark.isoformat()
-		return str(new_watermark)
+			watermark = new_watermark.isoformat()
+		else:
+			watermark = str(new_watermark)
+		logger.info("Next watermark should be: %s", watermark)
+		return watermark
 
 	@staticmethod
 	def process_fail_fast(
@@ -96,6 +101,11 @@ class Ingestion:
 		partition_keys: tuple[str],
 	) -> DataFrame:
 		"""Derive requested date partition columns from a date or timestamp column."""
+		logger.info(
+			"Adding partition columns %s from timestamp column %s",
+			partition_keys,
+			derived_from,
+		)
 		if not partition_keys or any(
 			key not in {"year", "month", "day"} for key in partition_keys
 		):
@@ -126,7 +136,30 @@ class Ingestion:
 		}
 		for key in partition_keys:
 			dataframe = dataframe.withColumn(key, partition_expressions[key])
+		logger.info("Added partition columns: %s", partition_keys)
 		return dataframe
+
+	@staticmethod
+	def write_if_not_empty(
+		dataframe: DataFrame,
+		s3_client: S3Client,
+		target_uri: str,
+		mode: str,
+		partition_by: list[str],
+	) -> None:
+		"""Write a non-empty DataFrame when rows are available."""
+		row_count = dataframe.count()
+		if row_count == 0:
+			logger.info("Source query returned no rows; nothing to write")
+			return
+
+		s3_client.write_partitioned_parquets(
+			dataframe,
+			target_uri,
+			mode=mode,
+			partition_by=partition_by,
+		)
+		logger.info("Successfully ingested %d rows", row_count)
 
 
 def main() -> None:
@@ -143,8 +176,8 @@ def main() -> None:
 	job.init(args["JOB_NAME"], args)
 
 	ingestion = Ingestion()
+	s3_client = S3Client()
 	watermark_value = ingestion.read_watermark()
-	logger.info("Loaded watermark value: %s", watermark_value)
 
 	schema_registry = SchemaRegistry(project_name, table_name)
 	host = 'host'
@@ -190,27 +223,18 @@ def main() -> None:
 		derived_from=timestamp_column,
 		partition_keys=partition_keys,
 	)
-	row_count = partitioned_df.count()
-	if row_count == 0:
-		logger.info("Source query returned no rows; nothing to write")
-		job.commit()
-		return
-	
-	# Write to S3
-	S3Client().write_partitioned_parquets(
+	ingestion.write_if_not_empty(
 		partitioned_df,
+		s3_client,
 		target_s3_uri,
 		mode=write_mode,
 		partition_by=list(partition_keys),
 	)
-	logger.info(f"Successfully ingested {row_count} rows")
 	
-	# Log new watermark (for reference, not persisted yet)
 	new_watermark = ingestion.calculate_new_watermark(
 		partitioned_df,
 		timestamp_column,
 	)
-	logger.info(f"Next watermark should be: {new_watermark}")
 	
 	logger.info("Ingestion completed successfully")
 	job.commit()
