@@ -2,6 +2,14 @@
 from datetime import date, datetime
 import logging
 import sys
+import time
+
+from sqlalchemy.exc import (
+	OperationalError,
+	ProgrammingError,
+	IntegrityError,
+	DatabaseError,
+)
 
 from awsglue.context import GlueContext
 from awsglue.job import Job
@@ -76,23 +84,84 @@ class Ingestion:
 		logger.info("Source schema validated")
 
 	@staticmethod
-	def apply_watermark_filter(query: str, watermark_value: str | None, 
-	                        timestamp_column: str) -> str:
+	def _apply_watermark_filter(
+		query: str,
+		watermark_value: str | None,
+		watermark_column: str,
+	) -> str:
 		"""Apply a watermark filter, or return the query unchanged for a full load."""
 		if not isinstance(query, str) or not query.strip():
 			raise ValueError("Query must be a non-empty string")
 		if watermark_value is not None and (not isinstance(watermark_value, str) or not watermark_value.strip()):
 			raise ValueError("Watermark value must be a non-empty string")
-		if not isinstance(timestamp_column, str) or not timestamp_column.strip():
-			raise ValueError("Timestamp column must be a non-empty string")
+		if not isinstance(watermark_column, str) or not watermark_column.strip():
+			raise ValueError("Watermark column must be a non-empty string")
 		normalized_query = query.strip().rstrip(";").strip()
 		if watermark_value is None:
 			logger.info("No watermark found; running full load")
 			return normalized_query
 		# Add WHERE clause for incremental load
-		filtered_query = f"{normalized_query} WHERE {timestamp_column} > '{watermark_value}'"
-		logger.info(f"Applied watermark filter: {timestamp_column} > {watermark_value}")
+		filtered_query = f"{normalized_query} WHERE {watermark_column} > '{watermark_value}'"
+		logger.info(
+			"Applied watermark filter: %s > %s",
+			watermark_column,
+			watermark_value,
+		)
 		return filtered_query
+
+	@staticmethod
+	def read_source_data(
+		connector: MSSQLConnector,
+		spark_session,
+		query: str,
+		watermark_value: str | None,
+		watermark_column: str,
+		max_retries: int = 3,
+	) -> DataFrame:
+		"""Apply the watermark and execute the source query."""
+		if max_retries < 0:
+			raise ValueError("max_retries must be non-negative")
+		filtered_query = Ingestion._apply_watermark_filter(
+			query,
+			watermark_value,
+			watermark_column,
+		)
+		for attempt in range(max_retries + 1):
+			try:
+				logger.info(
+					"Reading SQL Server query (attempt %d/%d)",
+					attempt + 1,
+					max_retries + 1,
+				)
+				dataframe = connector.execute_query(spark_session, filtered_query)
+				row_count = dataframe.count()
+				logger.info(
+					"Data read from SQL Server successfully: %d rows",
+					row_count,
+				)
+				return dataframe
+			except (ProgrammingError, IntegrityError) as error:
+				raise RuntimeError(f"Failed to read SQL Server query: {error}") from error
+			except OperationalError as error:
+				retryable = True
+			except DatabaseError as error:
+				error_message = str(error)
+				retryable = "1205" in error_message or "deadlock" in error_message.lower()
+			except Exception as error:
+				retryable = True
+
+			if not retryable or attempt >= max_retries:
+				raise RuntimeError(
+					f"Failed to read SQL Server query after {attempt + 1} attempts: {error}"
+				) from error
+			wait_time = 2 ** attempt
+			logger.warning(
+				"Query attempt %d failed: %s. Retrying in %d seconds",
+				attempt + 1,
+				error,
+				wait_time,
+			)
+			time.sleep(wait_time)
 
 	def add_partition_columns(
 		self,
@@ -185,7 +254,7 @@ def main() -> None:
 	user = 'user'
 	password = 'password'
 	schema_name = 'dbo'
-	timestamp_column = 'event_timestamp'
+	watermark_column = 'event_timestamp'
 	
 	mssql_connector = MSSQLConnector(
 		host=host,
@@ -194,20 +263,14 @@ def main() -> None:
 		password=password,
 	)
 	
-	# Apply watermark filter for incremental load
-	base_query = f'SELECT * FROM dbo.{table_name}'
-	filtered_query = ingestion.apply_watermark_filter(
-		base_query, 
-		watermark_value, 
-		timestamp_column
-	)
-	
-	# Read data from source with retry logic
-	source_df = mssql_connector.execute_query(
+	base_query = f'SELECT * FROM {schema_name}.{table_name}'
+	source_df = ingestion.read_source_data(
+		mssql_connector,
 		glue_context.spark_session,
-		filtered_query,
+		base_query,
+		watermark_value,
+		watermark_column,
 	)
-	logger.info("Data read from SQL Server successfully")
 	
 	# Validate schema matches contract
 	ingestion.process_fail_fast(
@@ -220,7 +283,7 @@ def main() -> None:
 	partition_keys = ("year", "month")
 	partitioned_df = ingestion.add_partition_columns(
 		source_df,
-		derived_from=timestamp_column,
+		derived_from=watermark_column,
 		partition_keys=partition_keys,
 	)
 	ingestion.write_if_not_empty(
@@ -233,7 +296,7 @@ def main() -> None:
 	
 	new_watermark = ingestion.calculate_new_watermark(
 		partitioned_df,
-		timestamp_column,
+		watermark_column,
 	)
 	
 	logger.info("Ingestion completed successfully")
