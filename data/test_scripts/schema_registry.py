@@ -18,7 +18,7 @@ class SchemaRegistry:
 		self.dataset = dataset
 		self.s3_client = S3Client()
 		self.schema_prefix = f"s3://{bucket}/{self.project}/{self.dataset}"
-		self.columns = self.load_avro_definition()
+		self.columns = self._load_avro_definition()
 
 	def _get_latest_avro_file(self) -> tuple[str, int]:
 		"""Return the latest schema URI and its numeric filename version."""
@@ -44,8 +44,22 @@ class SchemaRegistry:
 			latest_version,
 		)
 		return latest_schema_uri, latest_version
+
+	def _fields_to_columns(self, fields: list[dict]) -> list[dict]:
+		columns = []
+		for field in fields:
+			if not isinstance(field, dict):
+				raise ValueError("Each schema field must be a mapping")
+			name = field.get("name")
+			if not isinstance(name, str) or not name:
+				raise ValueError("Each schema field requires a non-empty name")
+			success, data_type, error = self._avro_to_spark_type(field.get("type"))
+			if not success:
+				raise ValueError(error)
+			columns.append({"name": name, "type": data_type})
+		return columns
 	
-	def load_avro_definition(self) -> list[dict]:
+	def _load_avro_definition(self) -> list[dict]:
 		"""Load an Avro schema definition from S3."""
 		self.schema_uri, self.schema_version = self._get_latest_avro_file()
 		logger.info(
@@ -54,7 +68,6 @@ class SchemaRegistry:
 			self.schema_version,
 		)
 		definition = self.s3_client.load_json(self.schema_uri)
-		self.definition = definition
 
 		if not isinstance(definition, dict):
 			raise ValueError("Avro schema definition must be a JSON object")
@@ -70,27 +83,9 @@ class SchemaRegistry:
 		fields = definition.get("fields")
 		if not isinstance(fields, list) or not fields:
 			raise ValueError("Avro schema must contain a non-empty fields list")
-	
-		columns = []
-		for field in fields:
-			if not isinstance(field, dict):
-				raise ValueError("Each schema field must be a mapping")
-
-			name = field.get("name")
-			if not isinstance(name, str) or not name:
-				raise ValueError("Each schema field requires a non-empty name")
-			# Convert Avro type to Spark type for schema validation
-			success, data_type, error = SchemaRegistry._avro_to_spark_type(field.get("type"))
-			if not success:
-				raise ValueError(error)
-
-			columns.append(
-				{
-					"name": name,
-					"type": data_type,
-				}
-			)
-		return columns
+		
+		self.definition = definition
+		return self._fields_to_columns(fields)
 	
 	def _has_schema_changes(self, dataframe) -> bool:
 		"""Return whether a DataFrame schema differs from the contract."""
@@ -199,25 +194,26 @@ class SchemaRegistry:
 		if avro_type not in type_mapping:
 			return False, None,  f"Unsupported Avro field type: {avro_type}"
 		return True, type_mapping[avro_type], None
+	
+	def _fields_to_type_map(self, fields: list[dict]) -> dict[str, str]:
+		"""Convert Avro fields to a field-name-to-Spark-type mapping."""
+		result = {}
+		for field in fields:
+			name = field.get("name")
+			if not isinstance(name, str) or not name:
+				raise ValueError("Each schema field requires a non-empty name")
+			success, data_type, error = self._avro_to_spark_type(field.get("type"))
+			if not success:
+				raise ValueError(error)
+			result[name] = data_type
+		return result
 
-	def _get_schema_changes(self, new_fields: list[dict]) -> dict:
-		"""Describe field additions, removals, and type changes."""
-		def field_types(fields: list[dict]) -> dict[str, str]:
-			result = {}
-			for field in fields:
-				name = field.get("name")
-				if not isinstance(name, str) or not name:
-					raise ValueError("Each schema field requires a non-empty name")
-				success, data_type, error = self._avro_to_spark_type(
-					field.get("type")
-				)
-				if not success:
-					raise ValueError(error)
-				result[name] = data_type
-			return result
-
-		old_field_types = field_types(self.definition["fields"])
-		new_field_types = field_types(new_fields)
+	@staticmethod
+	def _compare_field_types(
+		old_field_types: dict[str, str],
+		new_field_types: dict[str, str],
+	) -> dict:
+		"""Compare two field/type mappings."""
 		added = [
 			{"name": name, "type": new_field_types[name]}
 			for name in sorted(set(new_field_types) - set(old_field_types))
@@ -238,6 +234,12 @@ class SchemaRegistry:
 		return {"added": added, 
 		        "removed": removed, 
 				"modified": modified}
+
+	def _get_schema_changes(self, new_fields: list[dict]) -> dict:
+		"""Describe field additions, removals, and type changes."""
+		old_field_types = self._fields_to_type_map(self.definition["fields"])
+		new_field_types = self._fields_to_type_map(new_fields)
+		return self._compare_field_types(old_field_types, new_field_types)
 	
 	def _spark_dataframe_to_avro_schema(
 		self,

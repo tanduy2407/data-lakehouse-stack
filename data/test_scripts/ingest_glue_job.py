@@ -75,7 +75,7 @@ class Ingestion:
 		if not isinstance(error_s3_uri, str) or not error_s3_uri.strip():
 			raise ValueError("Error S3 URI must be a non-empty string")
 
-		if not schema_registry.is_match(dataframe):
+		if not schema_registry.validate_schema(dataframe):
 			logger.error("Schema mismatch; writing rejected data to %s", error_s3_uri)
 			S3Client().write_parquet(dataframe, error_s3_uri, mode="append")
 			raise FailFastIngestionError(
