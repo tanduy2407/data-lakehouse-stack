@@ -5,7 +5,6 @@ import os
 from datetime import datetime, timezone
 
 import boto3
-from store_to_s3 import S3Client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,7 +14,7 @@ YEAR_PREFIX = "year="
 MONTH_PREFIX = "month="
 DELETE_BATCH_SIZE = 1000
 s3_client = boto3.client("s3")
-s3_uri_parser = S3Client()
+
 
 
 class RetentionPolicyError(ValueError):
@@ -114,9 +113,19 @@ def _delete_prefix(bucket: str, key_prefix: str) -> int:
         deleted += _delete_batch(bucket, batch)
     return deleted
 
+def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
+    """Parse an S3 URI and return its bucket and key prefix ending in a slash."""
+    if not isinstance(s3_uri, str) or not s3_uri.startswith("s3://"):
+        raise ValueError("S3 URI must start with s3://")
+
+    bucket, separator, key = s3_uri.removeprefix("s3://").partition("/")
+    if not bucket or not separator or not key:
+        raise ValueError("S3 URI must include both a bucket and a key prefix")
+    return bucket, key.rstrip("/") + "/"
+
 def apply_retention(s3_uri: str, retention_years: int) -> dict:
-    """Delete partitions older than the retention range declared by one config entry."""
-    bucket, table_prefix = s3_uri_parser._parse_s3_prefix(s3_uri)
+    """Delete partitions of one table prefix that fall before its retention cutoff."""
+    bucket, table_prefix = _parse_s3_uri(s3_uri)
     range_start, range_end = _retention_range(retention_years)
     partitions, skipped = _list_month_partitions(bucket, table_prefix)
     retained = []
@@ -156,7 +165,7 @@ def apply_retention(s3_uri: str, retention_years: int) -> dict:
 
 
 def lambda_handler(event, context):
-    """Entry point that applies every retention config to its S3 URI."""
+    """Entry point that applies the retention policy to the S3 URI in the event."""
     event = event or {}
     s3_uri = event.get("s3_uri", "")
     retention_years = event.get("retention_years", 5)
