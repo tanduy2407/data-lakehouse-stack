@@ -13,8 +13,8 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 YEAR_PREFIX = "year="
 MONTH_PREFIX = "month="
 DELETE_BATCH_SIZE = 1000
+CALENDAR_START_MONTH = {"calendar": 1, "fiscal": 4}
 s3_client = boto3.client("s3")
-
 
 
 class RetentionPolicyError(ValueError):
@@ -23,16 +23,28 @@ class RetentionPolicyError(ValueError):
 
 def _retention_range(
     retention_years: int,
+    calendar_type: str,
 ) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Return the inclusive month bounds from the exact retention cutoff to now."""
+    """Return the inclusive month bounds for a calendar or fiscal retention period."""
     if not isinstance(retention_years, int) or isinstance(retention_years, bool):
         raise RetentionPolicyError("retention_years must be an integer")
     if retention_years < 1:
         raise RetentionPolicyError("retention_years must be at least 1")
 
     reference = datetime.now(timezone.utc)
-    cutoff = reference.replace(year=reference.year - retention_years)
-    return (cutoff.year, cutoff.month), (reference.year, reference.month)
+    start_month = CALENDAR_START_MONTH.get(calendar_type)
+    if start_month is None:
+        raise RetentionPolicyError("calendar_type must be 'calendar' or 'fiscal'")
+
+    # Example: October 2026 with calendar starts in January, so current period is 2026.
+    # Example: February 2027 with fiscal starts in April, so current period is 2026.
+    current_period_year = (
+        reference.year if reference.month >= start_month else reference.year - 1
+    )
+    cutoff_year = current_period_year - retention_years
+    # Example: five calendar years in October 2026 keeps 2021 onward and deletes 2020 and earlier.
+    # Example: five fiscal years in October 2026 keeps April 2021 onward and deletes earlier months.
+    return (cutoff_year, start_month), (reference.year, reference.month)
 
 
 def _format_month(year_month: tuple[int, int]) -> str:
@@ -92,9 +104,14 @@ def _list_month_partitions(bucket: str, table_prefix: str) -> tuple[list[dict], 
 def _delete_batch(bucket: str, batch: list[dict]) -> int:
     """Delete one batch of object keys and return how many were removed."""
     response = s3_client.delete_objects(Bucket=bucket, Delete={"Objects": batch})
-    for error in response.get("Errors", []):
+    errors = response.get("Errors", [])
+    for error in errors:
         logger.error(
             "Failed to delete s3://%s/%s: %s", bucket, error["Key"], error.get("Message")
+        )
+    if errors:
+        raise RuntimeError(
+            f"Failed to delete {len(errors)} object(s) from s3://{bucket}"
         )
     return len(response.get("Deleted", []))
 
@@ -123,10 +140,12 @@ def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
         raise ValueError("S3 URI must include both a bucket and a key prefix")
     return bucket, key.rstrip("/") + "/"
 
-def apply_retention(s3_uri: str, retention_years: int) -> dict:
-    """Delete partitions of one table prefix that fall before its retention cutoff."""
+def apply_retention(
+    s3_uri: str, retention_years: int, calendar_type: str = "calendar"
+) -> dict:
+    """Delete partitions before the configured calendar or fiscal cutoff."""
     bucket, table_prefix = _parse_s3_uri(s3_uri)
-    range_start, range_end = _retention_range(retention_years)
+    range_start, range_end = _retention_range(retention_years, calendar_type)
     partitions, skipped = _list_month_partitions(bucket, table_prefix)
     retained = []
     expired = []
@@ -152,6 +171,7 @@ def apply_retention(s3_uri: str, retention_years: int) -> dict:
     return {
         "s3_uri": s3_uri,
         "retention_years": retention_years,
+        "calendar_type": calendar_type,
         "retention_range": {
             "start": _format_month(range_start),
             "end": _format_month(range_end),
@@ -167,9 +187,18 @@ def apply_retention(s3_uri: str, retention_years: int) -> dict:
 def lambda_handler(event, context):
     """Entry point that applies the retention policy to the S3 URI in the event."""
     event = event or {}
+    if not isinstance(event, dict):
+        raise ValueError("EventBridge event must be an object")
+    # Example event structure:
+    # {
+    #     "s3_uri": "s3://my-bucket/gold/audit_plan",
+    #     "retention_years": 5,
+    #     "calendar_type": "calendar"
+    # }
     s3_uri = event.get("s3_uri", "")
     retention_years = event.get("retention_years", 5)
-    results = [apply_retention(s3_uri, retention_years)]
+    calendar_type = event.get("calendar_type", "calendar")
+    results = [apply_retention(s3_uri, retention_years, calendar_type)]
     total = sum(result["deleted_count"] for result in results)
     logger.info(
         "Deleted %d partition(s) across %d prefix(es)",
