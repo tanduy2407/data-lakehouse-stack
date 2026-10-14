@@ -185,21 +185,39 @@ def apply_retention(
 
 
 def lambda_handler(event, context):
-    """Entry point that applies the retention policy to the S3 URI in the event."""
-    event = event or {}
-    if not isinstance(event, dict):
-        raise ValueError("EventBridge event must be an object")
+    """Entry point that applies the retention policy to each S3 URI in the event."""
+    event = event or []
+    # Event must be a plain array, each entry fully self-contained:
     # Example event structure:
-    # {
-    #     "s3_uri": "s3://my-bucket/gold/audit_plan",
-    #     "retention_years": 5,
-    #     "calendar_type": "calendar"
-    # }
-    s3_uri = event.get("s3_uri", "")
-    retention_years = event.get("retention_years", 5)
-    calendar_type = event.get("calendar_type", "calendar")
-    results = [apply_retention(s3_uri, retention_years, calendar_type)]
-    total = sum(result["deleted_count"] for result in results)
+    # [
+    #   {"s3_uri": "s3://my-bucket/gold/audit_plan", "retention_years": 5, "calendar_type": "calendar"},
+    #   {"s3_uri": "s3://my-bucket/gold/claims", "retention_years": 3, "calendar_type": "fiscal"}
+    # ]
+    if not isinstance(event, list):
+        raise ValueError("EventBridge event must be a list of table configs")
+
+    results = []
+    for table in event:
+        if not isinstance(table, dict):
+            raise ValueError("Each table entry must be an object")
+
+        required_fields = ("s3_uri", "retention_years", "calendar_type")
+        missing_fields = [field for field in required_fields if field not in table]
+        if missing_fields:
+            raise ValueError(
+                f"Each table entry must include: {', '.join(missing_fields)}"
+            )
+
+        s3_uri = table["s3_uri"]
+        retention_years = table["retention_years"]
+        calendar_type = table["calendar_type"]
+        try:
+            results.append(apply_retention(s3_uri, retention_years, calendar_type))
+        except Exception as error:  # noqa: BLE001 - report and continue with remaining tables
+            logger.error("Failed to apply retention to %s: %s", s3_uri, error)
+            results.append({"s3_uri": s3_uri, "error": str(error)})
+
+    total = sum(result.get("deleted_count", 0) for result in results)
     logger.info(
         "Deleted %d partition(s) across %d prefix(es)",
         total,
