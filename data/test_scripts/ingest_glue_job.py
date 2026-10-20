@@ -16,7 +16,15 @@ from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, dayofmonth, month, year, max as spark_max
+from pyspark.sql.functions import (
+	col,
+	current_timestamp,
+	dayofmonth,
+	lit,
+	month,
+	year,
+	max as spark_max,
+)
 
 from mssql_connector import MSSQLConnector
 from schema_registry import SchemaRegistry
@@ -162,9 +170,9 @@ class Ingestion:
 				wait_time,
 			)
 			time.sleep(wait_time)
-
+			
+	@staticmethod
 	def add_partition_columns(
-		self,
 		dataframe: DataFrame,
 		derived_from: str,
 		partition_keys: tuple[str],
@@ -230,6 +238,23 @@ class Ingestion:
 		)
 		logger.info("Successfully ingested %d rows", row_count)
 
+	@staticmethod
+	def add_metadata_columns(
+		dataframe: DataFrame,
+		source_system: str,
+	) -> DataFrame:
+		"""Add required metadata describing the ingestion batch and source."""
+		if not isinstance(source_system, str) or not source_system.strip():
+			raise ValueError("Source system must be a non-empty string")
+
+		ingest_run_id = getResolvedOptions(sys.argv, ["JOB_RUN_ID"])["JOB_RUN_ID"]
+		return (
+			dataframe
+			.withColumn("_pipeline_run_id", lit(ingest_run_id))
+			.withColumn("_ingest_ts", current_timestamp())
+			.withColumn("_source_system", lit(source_system.strip()))
+		)
+
 
 def main() -> None:
 	"""Validate and ingest a JDBC query into partitioned Parquet on S3."""
@@ -277,6 +302,11 @@ def main() -> None:
 		source_df,
 		schema_registry,
 		error_s3_uri,
+	)
+
+	source_df = ingestion.add_metadata_columns(
+		source_df,
+		source_system="mssql",
 	)
 
 	# Add partition columns
