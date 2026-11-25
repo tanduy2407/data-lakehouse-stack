@@ -20,11 +20,16 @@ from pyspark.sql.functions import (
 	col,
 	current_timestamp,
 	dayofmonth,
+	count as spark_count,
+	concat_ws,
 	lit,
 	month,
+	try_to_timestamp,
+	when,
 	year,
 	max as spark_max,
 )
+from pyspark.sql.window import Window
 
 from mssql_connector import MSSQLConnector
 from schema_registry import SchemaRegistry
@@ -77,19 +82,125 @@ class Ingestion:
 	def process_fail_fast(
 		dataframe: DataFrame,
 		schema_registry: SchemaRegistry,
-		error_s3_uri: str,
 	) -> None:
-		"""Validate schema, save mismatched data, and fail fast on invalid data."""
-		if not isinstance(error_s3_uri, str) or not error_s3_uri.strip():
-			raise ValueError("Error S3 URI must be a non-empty string")
-
+		"""Fail immediately when the source schema does not match."""
 		if not schema_registry.validate_schema(dataframe):
-			logger.error("Schema mismatch; writing rejected data to %s", error_s3_uri)
-			S3Client().write_parquet(dataframe, error_s3_uri, mode="append")
+			logger.error("Source schema does not match the configured definition")
 			raise FailFastIngestionError(
 				"Source schema does not match the configured definition"
 			)
 		logger.info("Source schema validated")
+
+	@staticmethod
+	def validate_data(
+		dataframe: DataFrame,
+		validation_rules: dict[str, tuple[str, ...]],
+	) -> DataFrame:
+		"""Return all rows with validation errors attached."""
+		required_columns = validation_rules["required_columns"]
+		key_columns = validation_rules["key_columns"]
+		unique_columns = validation_rules["unique_columns"]
+		timestamp_columns = validation_rules["timestamp_columns"]
+		if "_validation_errors" in dataframe.columns:
+			raise ValueError("DataFrame already contains _validation_errors")
+
+		fields = {field.name: field for field in dataframe.schema.fields}
+		configured_columns = (
+			set(required_columns)
+			| set(key_columns)
+			| set(unique_columns)
+			| set(timestamp_columns)
+		)
+		missing_columns = configured_columns - set(fields)
+		if missing_columns:
+			raise ValueError(
+				"DataFrame is missing validation columns: "
+				+ ", ".join(sorted(missing_columns))
+			)
+		for column_name in timestamp_columns:
+			if fields[column_name].dataType.simpleString() not in {
+				"string",
+				"date",
+				"timestamp",
+				"timestamp_ntz",
+			}:
+				raise ValueError(
+					f"{column_name} must be a string, date, or timestamp column"
+				)
+
+		non_null_columns = tuple(dict.fromkeys((*required_columns, *key_columns)))
+		validation_errors = [
+			when(col(column_name).isNull(), lit(f"{column_name} is null"))
+			for column_name in non_null_columns
+		]
+		if key_columns:
+			all_key_values_present = col(key_columns[0]).isNotNull()
+			for key in key_columns[1:]:
+				all_key_values_present = all_key_values_present & col(key).isNotNull()
+			duplicate_keys = spark_count(lit(1)).over(
+				Window.partitionBy(*[col(key) for key in key_columns])
+			)
+			validation_errors.append(
+				when(
+					all_key_values_present & (duplicate_keys > 1),
+					lit("duplicate primary key"),
+				)
+			)
+		for column_name in unique_columns:
+			duplicate_values = spark_count(lit(1)).over(
+				Window.partitionBy(col(column_name))
+			)
+			validation_errors.append(
+				when(duplicate_values > 1, lit(f"duplicate {column_name}"))
+			)
+		for column_name in timestamp_columns:
+			timestamp_column = col(column_name)
+			if fields[column_name].dataType.simpleString() == "string":
+				timestamp_column = try_to_timestamp(timestamp_column)
+			validation_errors.append(
+				when(
+					col(column_name).isNotNull() & timestamp_column.isNull(),
+					lit(f"{column_name} is not a valid timestamp or date"),
+				)
+			)
+
+		validated = dataframe.withColumn(
+			"_validation_errors", concat_ws("; ", *validation_errors)
+		)
+		return validated
+
+	@staticmethod
+	def filter_valid_records(dataframe: DataFrame) -> DataFrame:
+		"""Return valid rows without the temporary validation column."""
+		if "_validation_errors" not in dataframe.columns:
+			raise ValueError("DataFrame must contain _validation_errors")
+		return dataframe.filter(col("_validation_errors") == "").drop(
+			"_validation_errors"
+		)
+
+	@staticmethod
+	def filter_invalid_records(dataframe: DataFrame) -> DataFrame:
+		"""Return rejected rows, retaining their validation reasons."""
+		if "_validation_errors" not in dataframe.columns:
+			raise ValueError("DataFrame must contain _validation_errors")
+		return dataframe.filter(col("_validation_errors") != "")
+
+	@staticmethod
+	def write_rejected_records(
+		rejected: DataFrame,
+		s3_client: S3Client,
+		error_s3_uri: str,
+	) -> int:
+		"""Append rejected rows to the error bucket and return their count."""
+		if not isinstance(error_s3_uri, str) or not error_s3_uri.strip():
+			raise ValueError("Error S3 URI must be a non-empty string")
+		rejected_count = rejected.count()
+		if rejected_count:
+			s3_client.write_parquet(rejected, error_s3_uri, mode="append")
+			logger.warning(
+				"Wrote %d invalid rows to %s", rejected_count, error_s3_uri
+			)
+		return rejected_count
 
 	@staticmethod
 	def _apply_watermark_filter(
@@ -298,11 +409,20 @@ def main() -> None:
 	)
 	
 	# Validate schema matches contract
+	validation_rules = schema_registry.get_validation_rules()
 	ingestion.process_fail_fast(
 		source_df,
 		schema_registry,
+	)
+	validated_df = ingestion.validate_data(source_df, validation_rules)
+	rejected_df = ingestion.filter_invalid_records(validated_df)
+	source_df = ingestion.filter_valid_records(validated_df)
+	rejected_count = ingestion.write_rejected_records(
+		rejected_df,
+		s3_client,
 		error_s3_uri,
 	)
+	logger.info("Validation rejected %d rows", rejected_count)
 
 	source_df = ingestion.add_metadata_columns(
 		source_df,

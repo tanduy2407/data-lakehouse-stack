@@ -86,6 +86,49 @@ class SchemaRegistry:
 		
 		self.definition = definition
 		return self._fields_to_columns(fields)
+
+	def get_validation_rules(self) -> dict[str, tuple[str, ...]]:
+		"""Derive row-validation rules from the loaded Avro schema."""
+		required_columns = []
+		key_columns = []
+		unique_columns = []
+		timestamp_columns = []
+
+		for field in self.definition["fields"]:
+			name = field["name"]
+			avro_type = field["type"]
+			types = avro_type if isinstance(avro_type, list) else [avro_type]
+			non_null_types = [
+				item for item in types if item != "null" and item is not None
+			]
+
+			if not any(item == "null" or item is None for item in types):
+				required_columns.append(name)
+			if field.get("primary_key") is True:
+				key_columns.append(name)
+			elif field.get("unique") is True:
+				unique_columns.append(name)
+
+			if len(non_null_types) == 1:
+				field_type = non_null_types[0]
+				if isinstance(field_type, dict) and field_type.get("logicalType") in {
+					"date",
+					"timestamp-millis",
+					"timestamp-micros",
+				}:
+					timestamp_columns.append(name)
+
+		if not key_columns and not unique_columns:
+			raise ValueError("Avro schema must mark at least one key as unique")
+		if not timestamp_columns:
+			raise ValueError("Avro schema must contain at least one date or timestamp")
+
+		return {
+			"required_columns": tuple(required_columns),
+			"key_columns": tuple(key_columns),
+			"unique_columns": tuple(unique_columns),
+			"timestamp_columns": tuple(timestamp_columns),
+		}
 	
 	def _has_schema_changes(self, dataframe) -> bool:
 		"""Return whether a DataFrame schema differs from the contract."""
@@ -118,13 +161,17 @@ class SchemaRegistry:
 		has_changes = self._has_schema_changes(dataframe)
 		if has_changes:
 			logger.error("Source schema mismatch")
+			return False
 		logger.info("Source view schema matches the configured definition")
+		return True
 	
 	@staticmethod
 	def _avro_to_spark_type(avro_type) -> tuple[bool, str | None, str | None]:
 		"""Convert an Avro type definition to Spark simpleString format."""
 		if isinstance(avro_type, list):
-			non_null_types = [item for item in avro_type if item not in {"null", None}]
+			non_null_types = [
+				item for item in avro_type if item != "null" and item is not None
+			]
 			if len(non_null_types) != 1:
 				return False, None,  "Avro unions must contain exactly one non-null data type"
 			return SchemaRegistry._avro_to_spark_type(non_null_types[0])
