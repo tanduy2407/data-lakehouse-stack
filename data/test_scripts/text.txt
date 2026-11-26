@@ -1,0 +1,17 @@
+Kích thước batch là một tham số có thể cấu hình (BATCH_SIZE). Con số 1.000 bên dưới chỉ là ví dụ. Giá trị thực tế sẽ được điều chỉnh dựa trên dữ liệu và thống kê thực tế (kích thước row, bộ nhớ worker, throughput quan sát được). Mỗi nguồn được chia một phần của mỗi batch theo tỷ lệ số row đang chờ xử lý.
+
+rows/poll = (số row chờ của nguồn / tổng số row chờ) × BATCH_SIZE
+
+Best case (BATCH_SIZE = 1.000): tỷ lệ chia đều, không phát sinh số lẻ. AP 4.000 + CPAR 12.000 = 16.000 rows
+
+AP: 25% → 250 rows/poll → 16 polls
+CPAR: 75% → 750 rows/poll → 16 polls
+Tổng mỗi batch = 1.000, các nguồn kết thúc cùng lúc.
+
+Worst case (BATCH_SIZE = 1.000): tỷ lệ lẻ và có nguồn rất nhỏ. AP 4.000 + CPAR 12.000 + XYZ 100 = 16.100 rows
+
+AP: 24,84% → 248,45 rows/poll
+CPAR: 74,53% → 745,34 rows/poll
+XYZ: 0,62% → 6,21 rows/poll
+Nếu làm tròn thô theo tỷ lệ xấp xỉ (250 + 750 + 6), tổng = 1.006, vượt BATCH_SIZE và có nguy cơ vượt giới hạn bộ nhớ.
+Nếu làm tròn xuống rồi dùng largest-remainder: AP 249 + CPAR 745 + XYZ 6 = 1.000. Mỗi nguồn cần 17 polls (thay vì 16), và poll cuối chỉ mang số row lẻ (ví dụ XYZ chỉ còn 4 rows).
